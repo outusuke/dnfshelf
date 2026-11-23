@@ -29,7 +29,7 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gio, GLib, GObject, Gtk, Pango  # noqa: E402
+from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango  # noqa: E402
 
 APP_ID = "org.example.Dnf5Manager"
 VERSIONLOCK_FILE = "/etc/dnf/versionlock.toml"
@@ -116,6 +116,27 @@ def parse_history(text):
         if m:
             out.append((int(m.group(1)), m.group(2), m.group(3), " ".join(m.group(4).split())))
     return out
+
+
+ACTIONS = {
+    "install": ("Install", None),
+    "remove": ("Remove", None),
+    "upgrade": ("Upgrade", None),
+    "pin": ("Pin version", "Lock the installed version (dnf5 versionlock add)"),
+    "unpin": ("Unpin", "Remove the lock or block (dnf5 versionlock delete)"),
+    "block": ("Block", "Exclude the versions currently available (dnf5 versionlock exclude)"),
+}
+
+
+def action_valid(p, action):
+    return {
+        "install": not p.installed,
+        "remove": p.installed,
+        "upgrade": p.installed and p.upgradable,
+        "pin": p.installed and not p.pinned,
+        "unpin": p.pinned,
+        "block": not p.pinned,
+    }[action]
 
 
 class Pkg(GObject.Object):
@@ -494,18 +515,19 @@ class Win(Adw.ApplicationWindow):
 
         # bottom: actions + info
         bar = Gtk.Box(spacing=6, margin_top=6, margin_bottom=6, margin_start=6, margin_end=6)
-        for label, act, tip in [
-                ("Install", "install", None), ("Remove", "remove", None),
-                ("Upgrade", "upgrade", None),
-                ("Pin version", "pin", "Lock the installed version (dnf5 versionlock add)"),
-                ("Unpin", "unpin", "Remove the lock or block (dnf5 versionlock delete)"),
-                ("Block", "block", "Exclude all versions (dnf5 versionlock exclude)")]:
-            b = Gtk.Button(label=label, tooltip_text=tip)
+        bar.set_size_request(-1, 48)
+        self.hint = Gtk.Label(label="Select packages to see available actions",
+                              css_classes=["dim-label"])
+        bar.append(self.hint)
+        self.action_btns = {}
+        for act, (label, tip) in ACTIONS.items():
+            b = Gtk.Button(label=label, tooltip_text=tip, visible=False)
             b.connect("clicked", lambda _b, a=act: self.mark(a))
             bar.append(b)
-        clear = Gtk.Button(label="Clear queue")
-        clear.connect("clicked", lambda *_: self.clear_queue())
-        bar.append(clear)
+            self.action_btns[act] = b
+        self.clear_btn = Gtk.Button(label="Clear queue", visible=False)
+        self.clear_btn.connect("clicked", lambda *_: self.clear_queue())
+        bar.append(self.clear_btn)
         self.count = Gtk.Label(label="", hexpand=True, xalign=1)
         bar.append(self.count)
 
@@ -531,8 +553,12 @@ class Win(Adw.ApplicationWindow):
         f = Gtk.SignalListItemFactory()
 
         def setup(_f, li):
-            li.set_child(Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END,
-                                   margin_start=6, margin_end=6))
+            lbl = Gtk.Label(xalign=0, hexpand=True, ellipsize=Pango.EllipsizeMode.END,
+                            margin_start=6, margin_end=6)
+            click = Gtk.GestureClick(button=3)
+            click.connect("pressed", lambda g, n, x, y, li=li, w=lbl: self.context_menu(li, w, x, y))
+            lbl.add_controller(click)
+            li.set_child(lbl)
 
         def bind(_f, li):
             li.binding = li.get_item().bind_property(
@@ -594,6 +620,9 @@ class Win(Adw.ApplicationWindow):
         add("pins", lambda: PinsWindow(self).present())
         add("install_launcher", lambda: self.launcher(install_launcher))
         add("remove_launcher", lambda: self.launcher(uninstall_launcher))
+        mark = Gio.SimpleAction.new("mark", GLib.VariantType.new("s"))
+        mark.connect("activate", lambda _a, param: self.mark(param.get_string()))
+        self.add_action(mark)
 
     def toast(self, msg):
         self.overlay.add_toast(Adw.Toast.new(msg))
@@ -670,7 +699,39 @@ class Win(Adw.ApplicationWindow):
         self.count.set_text(f"{model.get_n_items()} packages")
 
     # ---- details pane
+    def available_actions(self, sel):
+        return [a for a in ACTIONS
+                if any(action_valid(p, a) or a in p.actions for p in sel)]
+
+    def update_actions(self):
+        sel = self.selected()
+        valid = self.available_actions(sel)
+        for act, btn in self.action_btns.items():
+            btn.set_visible(act in valid)
+        self.hint.set_visible(not sel)
+
+    def context_menu(self, li, widget, x, y):
+        pos = li.get_position()
+        if not self.selection.is_selected(pos):
+            self.selection.select_item(pos, True)
+        menu = Gio.Menu()
+        for act in self.available_actions(self.selected()):
+            item = Gio.MenuItem.new(ACTIONS[act][0], None)
+            item.set_action_and_target_value("win.mark", GLib.Variant.new_string(act))
+            menu.append_item(item)
+        if menu.get_n_items() == 0:
+            return
+        pop = Gtk.PopoverMenu.new_from_model(menu)
+        pop.set_parent(widget)
+        rect = Gdk.Rectangle()
+        rect.x, rect.y, rect.width, rect.height = int(x), int(y), 1, 1
+        pop.set_pointing_to(rect)
+        pop.set_has_arrow(False)
+        pop.connect("closed", lambda p: GLib.idle_add(p.unparent))
+        pop.popup()
+
     def on_select(self, *_):
+        self.update_actions()
         sel = self.selected()
         self.info_token += 1
         if not sel:
@@ -692,14 +753,7 @@ class Win(Adw.ApplicationWindow):
 
     # ---- queue
     def mark(self, action):
-        valid = lambda p: {
-            "install": not p.installed,
-            "remove": p.installed,
-            "upgrade": p.installed and p.upgradable,
-            "pin": p.installed and not p.pinned,
-            "unpin": p.pinned,
-            "block": not p.pinned,
-        }[action]
+        valid = lambda p: action_valid(p, action)
         group = {"install", "remove", "upgrade"} if action in ("install", "remove", "upgrade") \
             else {"pin", "unpin", "block"}
         for p in self.selected():
@@ -730,6 +784,8 @@ class Win(Adw.ApplicationWindow):
         n = len(self.queue)
         self.apply_btn.set_label(f"Apply ({n})" if n else "Apply")
         self.apply_btn.set_sensitive(n > 0)
+        self.clear_btn.set_visible(n > 0)
+        self.update_actions()
 
     def apply(self):
         by = lambda a: [p for p in self.queue if a in p.actions]
