@@ -37,6 +37,21 @@ from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango  # noqa: E402
 
 APP_ID = "org.outusuke.Dnfshelf"
 VERSIONLOCK_FILE = "/etc/dnf/versionlock.toml"
+AUTO_CONF = "/etc/dnf/automatic.conf"
+AUTO_DEFAULTS_CONF = "/usr/share/dnf5/dnf5-plugins/automatic.conf"
+AUTO_TIMER = "dnf5-automatic.timer"
+AUTO_PKG = "dnf5-plugin-automatic"
+AUTO_DEFAULTS = {"apply_updates": "no", "download_updates": "yes",
+                 "upgrade_type": "default", "reboot": "never"}
+AUTO_MODES = [{"apply_updates": "no", "download_updates": "no"},
+              {"apply_updates": "no", "download_updates": "yes"},
+              {"apply_updates": "yes", "download_updates": "yes"}]
+AUTO_MODE_LABELS = ["Check only", "Download only", "Download and install"]
+AUTO_MODE_HINTS = ["Only reports what is available",
+                   "Downloads updates, you install them from here",
+                   "Installs updates without asking"]
+AUTO_SCOPES = {"default": "All updates", "security": "Security updates only"}
+AUTO_REBOOTS = {"never": "Never", "when-needed": "When needed", "when-changed": "After any update"}
 QF = r"%{name}|%{evr}|%{arch}|%{repoid}|%{summary}\n"
 # List packages from the local metadata cache (no network round trip on every start).
 # Falls back to a normal dnf5 run automatically if that fails. Use "Refresh repo
@@ -145,6 +160,66 @@ def load_pin_entries():
             for c in p.get("conditions", []))
         out.append((p["name"], conds or "locked"))
     return sorted(out)
+
+
+def ini_values(text, section):
+    out, cur = {}, None
+    for line in text.splitlines():
+        m = re.match(r"\s*\[([^\]]+)\]", line)
+        if m:
+            cur = m.group(1).strip()
+            continue
+        m = re.match(r"\s*([\w.-]+)\s*=\s*(.*?)\s*$", line)
+        if cur == section and m:
+            out[m.group(1)] = m.group(2)
+    return out
+
+
+def set_ini_keys(text, section, values):
+    """Set keys in one INI section and leave every other line as it is."""
+    out, cur, seen, last, found = [], None, set(), 0, False
+    for line in text.splitlines():
+        m = re.match(r"\s*\[([^\]]+)\]", line)
+        if m:
+            cur = m.group(1).strip()
+            found = found or cur == section
+        k = re.match(r"\s*([\w.-]+)\s*=", line)
+        if cur == section and k and k.group(1) in values:
+            line = f"{k.group(1)} = {values[k.group(1)]}"
+            seen.add(k.group(1))
+        out.append(line)
+        if cur == section and line.strip() and not line.lstrip().startswith(("#", ";")):
+            last = len(out)
+    missing = [f"{k} = {v}" for k, v in values.items() if k not in seen]
+    if found:
+        out[last:last] = missing
+    elif missing:
+        out += ([""] if out else []) + [f"[{section}]"] + missing
+    return "\n".join(out) + "\n"
+
+
+def automatic_settings():
+    vals = dict(AUTO_DEFAULTS)
+    for path in (AUTO_DEFAULTS_CONF, AUTO_CONF):
+        try:
+            with open(path) as f:
+                vals.update(ini_values(f.read(), "commands"))
+        except OSError:
+            pass
+    on = lambda k: vals[k].lower() in ("yes", "true", "1", "on", "enabled")
+    mode = 2 if on("apply_updates") else 1 if on("download_updates") else 0
+    return {"mode": mode, "scope": vals["upgrade_type"], "reboot": vals["reboot"]}
+
+
+def timer_state():
+    """(unit exists, enabled, next run) for dnf5-automatic.timer."""
+    try:
+        have = subprocess.run(["systemctl", "cat", AUTO_TIMER], capture_output=True).returncode == 0
+        enabled = run(["systemctl", "is-enabled", AUTO_TIMER]).strip() == "enabled"
+        nxt = run(["systemctl", "show", AUTO_TIMER, "-p", "NextElapseUSecRealtime", "--value"]).strip()
+    except OSError:
+        return False, False, ""
+    return have, enabled, nxt
 
 
 def collect_raw():
@@ -596,6 +671,121 @@ class PinsWindow(Adw.Window):
         self.parent_win.run_root("Removed all pins", [["dnf5", "versionlock", "clear"]])
 
 
+class AutoUpdatesWindow(Adw.Window):
+    def __init__(self, parent):
+        super().__init__(transient_for=parent, modal=True, title="Automatic updates",
+                         default_width=560, default_height=600)
+        self.parent_win = parent
+        have, enabled, nxt = timer_state()
+        cfg = automatic_settings()
+        self.scopes = list(AUTO_SCOPES) + [v for v in [cfg["scope"]] if v not in AUTO_SCOPES]
+        self.reboots = list(AUTO_REBOOTS) + [v for v in [cfg["reboot"]] if v not in AUTO_REBOOTS]
+        self.loaded = {"enabled": enabled, "mode": cfg["mode"],
+                       "scope": self.scopes.index(cfg["scope"]),
+                       "reboot": self.reboots.index(cfg["reboot"])}
+
+        hb = Adw.HeaderBar()
+        self.apply_btn = Gtk.Button(label="Apply", css_classes=["suggested-action"])
+        self.apply_btn.connect("clicked", lambda *_: self.apply())
+        hb.pack_end(self.apply_btn)
+
+        page = Adw.PreferencesPage()
+        if not have:
+            row = Adw.ActionRow(title="dnf5 automatic is not installed", subtitle=AUTO_PKG)
+            btn = Gtk.Button(label="Install", valign=Gtk.Align.CENTER,
+                             css_classes=["suggested-action"])
+            btn.connect("clicked", lambda *_: self.install_plugin())
+            row.add_suffix(btn)
+            grp = Adw.PreferencesGroup()
+            grp.add(row)
+            page.add(grp)
+
+        self.sw = Adw.SwitchRow(title="Run automatically", subtitle=AUTO_TIMER, active=enabled)
+        self.sw.connect("notify::active", lambda *_: self.refresh())
+        when = nxt if enabled and nxt not in ("", "n/a") else "Not scheduled"
+        sched = Adw.PreferencesGroup(title="Schedule",
+                                     description=f"Settings are saved to {AUTO_CONF}")
+        sched.add(self.sw)
+        sched.add(Adw.ActionRow(title="Next run", subtitle=GLib.markup_escape_text(when)))
+
+        self.mode_row = self.combo("Mode", AUTO_MODE_LABELS, self.loaded["mode"])
+        self.scope_row = self.combo("Which updates", [AUTO_SCOPES.get(v, f"{v} (current config)")
+                                                for v in self.scopes], self.loaded["scope"])
+        what = Adw.PreferencesGroup(title="Updates")
+        what.add(self.mode_row)
+        what.add(self.scope_row)
+
+        self.reboot_row = self.combo("Restart after installing",
+                                     [AUTO_REBOOTS.get(v, f"{v} (current config)")
+                                      for v in self.reboots], self.loaded["reboot"])
+        restart = Adw.PreferencesGroup(
+            title="Restart",
+            description="Only applies when updates are installed. "
+                        "By default dnf5 waits 5 minutes before restarting.")
+        restart.add(self.reboot_row)
+
+        for grp in (sched, what, restart):
+            grp.set_sensitive(have)
+            page.add(grp)
+        tb = Adw.ToolbarView()
+        tb.add_top_bar(hb)
+        tb.set_content(page)
+        self.set_content(tb)
+        self.refresh()
+
+    def combo(self, title, labels, selected):
+        row = Adw.ComboRow(title=title)
+        row.set_model(Gtk.StringList.new(labels))
+        row.set_selected(selected)
+        row.connect("notify::selected", lambda *_: self.refresh())
+        return row
+
+    def current(self):
+        return {"enabled": self.sw.get_active(), "mode": self.mode_row.get_selected(),
+                "scope": self.scope_row.get_selected(), "reboot": self.reboot_row.get_selected()}
+
+    def refresh(self):
+        now = self.current()
+        self.mode_row.set_subtitle(AUTO_MODE_HINTS[now["mode"]])
+        self.reboot_row.set_sensitive(now["mode"] == 2)
+        self.apply_btn.set_sensitive(now != self.loaded)
+
+    def apply(self):
+        now = self.current()
+        vals = {}  # only touch what changed, so unrelated values in the file survive
+        if now["mode"] != self.loaded["mode"]:
+            vals.update(AUTO_MODES[now["mode"]])
+        if now["scope"] != self.loaded["scope"]:
+            vals["upgrade_type"] = self.scopes[now["scope"]]
+        if now["reboot"] != self.loaded["reboot"]:
+            vals["reboot"] = self.reboots[now["reboot"]]
+        cmds = []
+        if vals:
+            try:
+                with open(AUTO_CONF) as f:
+                    old = f.read()
+            except OSError:
+                old = ""
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            tmp = os.path.join(CACHE_DIR, "automatic.conf")
+            with open(tmp, "w") as f:
+                f.write(set_ini_keys(old, "commands", vals))
+            # install, not mv: the new file gets the SELinux label of /etc/dnf
+            cmds.append(["install", "-m", "644", tmp, AUTO_CONF])
+        if now["enabled"] != self.loaded["enabled"]:
+            cmds.append(["systemctl", "enable" if now["enabled"] else "disable", "--now", AUTO_TIMER])
+        self.close()
+        self.parent_win.run_root("Automatic updates saved", cmds)
+
+    def install_plugin(self):
+        self.close()
+        cmd = ["dnf5", "-y", "install", AUTO_PKG]
+        dry = [c for c in cmd if c != "-y"] + ["--assumeno"]
+        self.parent_win.run_cmd(f"Install {AUTO_PKG}", ["pkexec", *cmd],
+                                shlex.join(cmd) + "\n\nThe dry run below shows what will be installed.",
+                                reload=True, dry=[dry])
+
+
 class CompsPage(Gtk.Box):
     """List of comps groups or environments with info and install/remove."""
 
@@ -1038,7 +1228,8 @@ class Win(Adw.ApplicationWindow):
             [("Mark selected as user-installed", "mark_user"),
              ("Mark selected as dependency", "mark_auto")],
             [("Transaction history", "history"), ("Repositories", "repos"),
-             ("Pinned packages", "pins"), ("Groups and environments", "groups")],
+             ("Pinned packages", "pins"), ("Groups and environments", "groups"),
+             ("Automatic updates", "auto_updates")],
             [("Install to app menu", "install_launcher"),
              ("Remove from app menu", "remove_launcher")],
         ]
@@ -1068,6 +1259,7 @@ class Win(Adw.ApplicationWindow):
         add("repos", lambda: RepoWindow(self).present())
         add("pins", lambda: PinsWindow(self).present())
         add("groups", lambda: GroupsWindow(self).present())
+        add("auto_updates", lambda: AutoUpdatesWindow(self).present())
         add("install_launcher", lambda: self.launcher(install_launcher))
         add("remove_launcher", lambda: self.launcher(uninstall_launcher))
         mark = Gio.SimpleAction.new("mark", GLib.VariantType.new("s"))
