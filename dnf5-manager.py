@@ -8,6 +8,10 @@ Dependencies:
 Run:
     python3 dnf5-manager.py
 
+Install to ~/.local/bin and the app menu (or use the menu entry inside the app):
+    python3 dnf5-manager.py --install
+    python3 dnf5-manager.py --uninstall
+
 Everything goes through the dnf5 CLI. Privileged operations use pkexec, so you
 get one polkit prompt per transaction. Pins use `dnf5 versionlock`
 (state in /etc/dnf/versionlock.toml).
@@ -15,7 +19,9 @@ get one polkit prompt per transaction. Pins use `dnf5 versionlock`
 import os
 import re
 import shlex
+import shutil
 import subprocess
+import sys
 import threading
 import tomllib
 
@@ -416,6 +422,8 @@ class Win(Adw.ApplicationWindow):
              ("Mark selected as dependency", "mark_auto")],
             [("Transaction history", "history"), ("Repositories", "repos"),
              ("Show all pins", "pins")],
+            [("Install to app menu", "install_launcher"),
+             ("Remove from app menu", "remove_launcher")],
         ]
         for sec in sections:
             s = Gio.Menu()
@@ -447,9 +455,17 @@ class Win(Adw.ApplicationWindow):
         add("repos", lambda: RepoWindow(self).present())
         add("pins", lambda: self.run_cmd(
             "Pins", ["dnf5", "versionlock", "list"], "dnf5 versionlock list", autorun=True))
+        add("install_launcher", lambda: self.launcher(install_launcher))
+        add("remove_launcher", lambda: self.launcher(uninstall_launcher))
 
     def toast(self, msg):
         self.overlay.add_toast(Adw.Toast.new(msg))
+
+    def launcher(self, fn):
+        try:
+            self.toast(fn())
+        except Exception as e:
+            self.toast(f"Failed: {e}")
 
     def run_cmd(self, title, argv, preview, reload=False, autorun=False, dry=None):
         RunWindow(self, title, argv, preview,
@@ -609,6 +625,46 @@ class Win(Adw.ApplicationWindow):
         self.run_cmd(f"Mark as {label}", ["pkexec", *cmd], shlex.join(cmd))
 
 
+BIN_PATH = os.path.expanduser("~/.local/bin/dnf5-manager")
+DESKTOP_PATH = os.path.expanduser(f"~/.local/share/applications/{APP_ID}.desktop")
+DESKTOP_ENTRY = """[Desktop Entry]
+Type=Application
+Name=DNF5 Package Manager
+Comment=Synaptic-style package manager for Fedora
+Exec="{exec}"
+Icon=system-software-install
+Terminal=false
+Categories=System;PackageManager;GTK;
+Keywords=dnf;rpm;packages;software;
+StartupWMClass={app_id}
+"""
+
+
+def install_launcher():
+    """Copy this script to ~/.local/bin and add an app-menu entry."""
+    src = os.path.abspath(__file__)
+    os.makedirs(os.path.dirname(BIN_PATH), exist_ok=True)
+    os.makedirs(os.path.dirname(DESKTOP_PATH), exist_ok=True)
+    if not (os.path.exists(BIN_PATH) and os.path.samefile(src, BIN_PATH)):
+        shutil.copyfile(src, BIN_PATH)
+    os.chmod(BIN_PATH, 0o755)
+    with open(DESKTOP_PATH, "w") as f:
+        f.write(DESKTOP_ENTRY.format(exec=BIN_PATH, app_id=APP_ID))
+    if shutil.which("update-desktop-database"):
+        subprocess.run(["update-desktop-database", os.path.dirname(DESKTOP_PATH)],
+                       capture_output=True)
+    return f"Installed {BIN_PATH} and added to the app menu"
+
+
+def uninstall_launcher():
+    removed = []
+    for path in (BIN_PATH, DESKTOP_PATH):
+        if os.path.exists(path):
+            os.remove(path)
+            removed.append(path)
+    return "Removed " + ", ".join(removed) if removed else "Nothing to remove"
+
+
 class App(Adw.Application):
     def __init__(self):
         super().__init__(application_id=APP_ID)
@@ -620,4 +676,9 @@ class App(Adw.Application):
 
 
 if __name__ == "__main__":
-    App().run(None)
+    if "--install" in sys.argv[1:]:
+        print(install_launcher())
+    elif "--uninstall" in sys.argv[1:]:
+        print(uninstall_launcher())
+    else:
+        App().run(None)
