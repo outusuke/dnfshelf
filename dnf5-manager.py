@@ -225,10 +225,15 @@ ACTIONS = {
     "install": ("Install", None),
     "remove": ("Remove", None),
     "upgrade": ("Upgrade", None),
+    "reinstall": ("Reinstall", "Reinstall the installed version (dnf5 reinstall)"),
+    "downgrade": ("Downgrade", "Install the next older available version (dnf5 downgrade)"),
     "pin": ("Pin version", "Lock the installed version (dnf5 versionlock add)"),
     "unpin": ("Unpin", "Remove the lock or block (dnf5 versionlock delete)"),
     "block": ("Block", "Exclude the versions currently available (dnf5 versionlock exclude)"),
 }
+
+
+CHANGE_ACTIONS = {"install", "remove", "upgrade", "reinstall", "downgrade"}
 
 
 def action_valid(p, action):
@@ -236,6 +241,8 @@ def action_valid(p, action):
         "install": not p.installed,
         "remove": p.installed,
         "upgrade": p.installed and p.upgradable,
+        "reinstall": p.installed and p.latest == p.inst,  # current version is in a repo
+        "downgrade": p.installed,
         "pin": p.installed and not p.pinned,
         "unpin": p.pinned,
         "block": not p.pinned,
@@ -621,6 +628,11 @@ class Win(Adw.ApplicationWindow):
                                     css_classes=["suggested-action"])
         self.apply_btn.connect("clicked", lambda *_: self.apply())
         hb.pack_end(self.apply_btn)
+        self.allow_erasing = Gtk.CheckButton(
+            label="Allow erasing",
+            tooltip_text="Let install/upgrade remove installed packages to resolve conflicts "
+                         "(dnf5 --allowerasing). Check the dry run before pressing Run.")
+        hb.pack_end(self.allow_erasing)
 
         # package table
         self.view = Gtk.ColumnView(show_row_separators=True)
@@ -730,7 +742,8 @@ class Win(Adw.ApplicationWindow):
         m = Gio.Menu()
         sections = [
             [("Reload package list", "reload"), ("Refresh repo metadata", "metadata")],
-            [("Upgrade all", "upgrade_all"), ("Remove unneeded (autoremove)", "autoremove"),
+            [("Upgrade all", "upgrade_all"),
+             ("Upgrade security updates only", "upgrade_security"), ("Remove unneeded (autoremove)", "autoremove"),
              ("Clean caches", "clean")],
             [("Mark selected as user-installed", "mark_user"),
              ("Mark selected as dependency", "mark_auto")],
@@ -756,8 +769,8 @@ class Win(Adw.ApplicationWindow):
         add("metadata", lambda: self.run_cmd(
             "Refresh metadata", ["pkexec", "sh", "-c", "dnf5 clean metadata && dnf5 makecache"],
             "Refresh repository metadata", reload=True))
-        add("upgrade_all", lambda: self.run_cmd(
-            "Upgrade all", ["pkexec", "dnf5", "-y", "upgrade"], "dnf5 -y upgrade", reload=True))
+        add("upgrade_all", self.upgrade_all)
+        add("upgrade_security", self.upgrade_security)
         add("autoremove", lambda: self.run_cmd(
             "Autoremove", ["pkexec", "dnf5", "-y", "autoremove"], "dnf5 -y autoremove", reload=True))
         add("clean", lambda: self.run_cmd(
@@ -772,6 +785,24 @@ class Win(Adw.ApplicationWindow):
         mark = Gio.SimpleAction.new("mark", GLib.VariantType.new("s"))
         mark.connect("activate", lambda _a, param: self.mark(param.get_string()))
         self.add_action(mark)
+
+    def erase_flag(self):
+        return ["--allowerasing"] if self.allow_erasing.get_active() else []
+
+    def upgrade_cmd(self, *extra):
+        return ["dnf5", "-y", "upgrade", *extra, *self.erase_flag()]
+
+    def upgrade_all(self):
+        cmd = self.upgrade_cmd()
+        self.run_cmd("Upgrade all", ["pkexec", *cmd], shlex.join(cmd), reload=True)
+
+    def upgrade_security(self):
+        cmd = self.upgrade_cmd("--security")
+        dry = [c for c in cmd if c != "-y"] + ["--assumeno"]
+        self.run_cmd("Upgrade security updates", ["pkexec", *cmd],
+                     shlex.join(cmd) + "\n\nUpgrades only to the lowest versions that fix "
+                     "security advisories, not necessarily the newest.\nThe dry run below "
+                     "shows what will change.", reload=True, dry=[dry])
 
     def toast(self, msg):
         self.overlay.add_toast(Adw.Toast.new(msg))
@@ -1029,8 +1060,7 @@ class Win(Adw.ApplicationWindow):
     # ---- queue
     def mark(self, action):
         valid = lambda p: action_valid(p, action)
-        group = {"install", "remove", "upgrade"} if action in ("install", "remove", "upgrade") \
-            else {"pin", "unpin", "block"}
+        group = CHANGE_ACTIONS if action in CHANGE_ACTIONS else {"pin", "unpin", "block"}
         for p in self.selected():
             if action in p.actions:
                 p.actions.discard(action)
@@ -1072,9 +1102,15 @@ class Win(Adw.ApplicationWindow):
         if by("remove"):
             cmds.append(["dnf5", "-y", "remove", *[p.spec for p in by("remove")]])
         if by("install"):
-            cmds.append(["dnf5", "-y", "install", *[p.spec for p in by("install")]])
+            cmds.append(["dnf5", "-y", "install", *self.erase_flag(),
+                         *[p.spec for p in by("install")]])
         if by("upgrade"):
-            cmds.append(["dnf5", "-y", "upgrade", *[p.spec for p in by("upgrade")]])
+            cmds.append(["dnf5", "-y", "upgrade", *self.erase_flag(),
+                         *[p.spec for p in by("upgrade")]])
+        if by("reinstall"):
+            cmds.append(["dnf5", "-y", "reinstall", *[p.spec for p in by("reinstall")]])
+        if by("downgrade"):
+            cmds.append(["dnf5", "-y", "downgrade", *[p.spec for p in by("downgrade")]])
         if by("pin"):
             cmds.append(["dnf5", "versionlock", "add", *[p.name for p in by("pin")]])
         if by("block"):
