@@ -163,8 +163,24 @@ def _section(title, items, limit=300):
     return "\n".join(out)
 
 
+def changelog_text(p):
+    """Changelog; for upgradable packages only the entries newer than the installed version."""
+    attempts = ([["--upgrades"]] if p.upgradable else []) + [["--count=10"]]
+    for extra in attempts:
+        out = ""
+        if USE_CACHEONLY:
+            out = run(["dnf5", "--cacheonly", "changelog", *extra, p.spec])
+        if "Changelogs for" not in out:  # changelogs (other.xml) may not be cached yet
+            out = run(["dnf5", "changelog", *extra, p.spec])
+        if "Changelogs for" in out:
+            return out.strip()
+    return "No changelog available."
+
+
 def detail_text(p, idx):
-    """Text for one tab of the details pane (0 info, 1 dependencies, 2 files)."""
+    """Text for one tab of the details pane (0 info, 1 dependencies, 2 files, 3 changelog)."""
+    if idx == 3:
+        return changelog_text(p)
     scope = ["--installed"] if p.installed else []
     if idx == 0:
         return dnf5("info", p.spec) or "No information available."
@@ -913,7 +929,7 @@ class Win(Adw.ApplicationWindow):
 
         self.tab_views = []
         self.notebook = Gtk.Notebook(vexpand=True)
-        for title in ("Info", "Dependencies", "Files"):
+        for title in ("Info", "Dependencies", "Files", "Changelog"):
             tv = Gtk.TextView(editable=False, monospace=True, left_margin=8, top_margin=8,
                               wrap_mode=Gtk.WrapMode.WORD_CHAR)
             self.tab_views.append(tv)
