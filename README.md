@@ -41,8 +41,6 @@ python3 dnfshelf.py
 - `--allowerasing` is never a setting. It is offered only after a dry run fails, for that transaction only.
 - Pins live in `/etc/dnf/versionlock.toml`.
 
-## Limitations
+## License
 
-- RPM only. No Flatpak.
-- Not packaged. Run it from a checkout.
-- Tested by one person on one machine. Expect rough edges and report them as issues.
+GPL-3.0-or-later. See [LICENSE](LICENSE).
