@@ -43,7 +43,8 @@ QF = r"%{name}|%{evr}|%{arch}|%{repoid}|%{summary}\n"
 USE_CACHEONLY = True
 CACHE_DIR = os.path.join(GLib.get_user_cache_dir(), "dnf5-manager")
 CACHE_FILE = os.path.join(CACHE_DIR, "packages.json")
-MODES = ["All", "Installed", "Not installed", "Upgradable", "Pinned", "Queued changes"]
+MODES = ["All", "Installed", "Not installed", "Upgradable", "Pinned", "Queued changes",
+         "Security updates"]
 
 
 # ---------------------------------------------------------------- data layer
@@ -51,17 +52,17 @@ def run(argv):
     return subprocess.run(argv, capture_output=True, text=True).stdout
 
 
-def dnf5(*args):
+def dnf5(*args, cache=True):
     """Read-only dnf5 call, preferring the local metadata cache."""
-    if USE_CACHEONLY:
+    if USE_CACHEONLY and cache:
         r = subprocess.run(["dnf5", "--cacheonly", *args], capture_output=True, text=True)
         if r.returncode == 0:
             return r.stdout
     return run(["dnf5", *args])
 
 
-def query(*flags):
-    out = dnf5("repoquery", *flags, "--queryformat", QF)
+def query(*flags, cache=True):
+    out = dnf5("repoquery", *flags, "--queryformat", QF, cache=cache)
     rows = []
     for line in out.splitlines():
         parts = line.split("|", 4)
@@ -121,6 +122,37 @@ def collect_raw():
 def build_pkgs(raw):
     pins = load_pins()
     return [Pkg(d, d[0] in pins) for d in raw]
+
+
+def _section(title, items, limit=300):
+    out = [f"{title} ({len(items)}):"]
+    out += [f"  {x}" for x in items[:limit]]
+    if len(items) > limit:
+        out.append(f"  ... and {len(items) - limit} more")
+    return "\n".join(out)
+
+
+def detail_text(p, idx):
+    """Text for one tab of the details pane (0 info, 1 dependencies, 2 files)."""
+    scope = ["--installed"] if p.installed else []
+    if idx == 0:
+        return dnf5("info", p.spec) or "No information available."
+    if idx == 1:
+        req = sorted(set(dnf5("repoquery", *scope, "--requires", p.spec).split("\n")) - {""})
+        by = dnf5("repoquery", *scope, "--whatrequires", p.name,
+                  "--queryformat", r"%{name}.%{arch}\n")
+        by = sorted(set(by.split("\n")) - {""} - {p.spec})
+        return (_section("Requires", req) + "\n\n" +
+                _section("Required by (packages that require this package by name)", by))
+    out = dnf5("repoquery", *scope, "--files", p.spec)
+    if not out.strip() and not p.installed:  # filelists metadata may not be cached yet
+        out = dnf5("repoquery", *scope, "--files", p.spec, cache=False)
+    lines = out.splitlines()
+    if not lines:
+        return "No file list available."
+    if len(lines) > 20000:
+        lines = lines[:20000] + ["... list truncated"]
+    return "\n".join(lines)
 
 
 def read_cache():
@@ -544,6 +576,11 @@ class Win(Adw.ApplicationWindow):
         self.live = set()      # currently bound Status/Queued cells
         self.sort_prop, self.sort_desc = "name", False
         self.col_props = {}
+        self.cur = None        # package shown in the details pane
+        self.detail_cache = {}
+        self.security = None   # {(name, arch)} of packages with security upgrades, lazy
+        self.security_loading = False
+        self.loading_main = False
 
         # header bar
         hb = Adw.HeaderBar()
@@ -597,11 +634,19 @@ class Win(Adw.ApplicationWindow):
         self.count = Gtk.Label(label="", hexpand=True, xalign=1)
         bar.append(self.count)
 
-        self.info = Gtk.TextView(editable=False, monospace=True, left_margin=8, top_margin=8,
-                                 wrap_mode=Gtk.WrapMode.WORD_CHAR)
+        self.tab_views = []
+        self.notebook = Gtk.Notebook(vexpand=True)
+        for title in ("Info", "Dependencies", "Files"):
+            tv = Gtk.TextView(editable=False, monospace=True, left_margin=8, top_margin=8,
+                              wrap_mode=Gtk.WrapMode.WORD_CHAR)
+            self.tab_views.append(tv)
+            self.notebook.append_page(
+                Gtk.ScrolledWindow(vexpand=True, min_content_height=170, child=tv),
+                Gtk.Label(label=title))
+        self.notebook.connect("switch-page", self.on_tab_switch)
         bottom = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         bottom.append(bar)
-        bottom.append(Gtk.ScrolledWindow(vexpand=True, min_content_height=170, child=self.info))
+        bottom.append(self.notebook)
 
         paned = Gtk.Paned(orientation=Gtk.Orientation.VERTICAL, position=480,
                           start_child=Gtk.ScrolledWindow(vexpand=True, child=self.view),
@@ -737,11 +782,15 @@ class Win(Adw.ApplicationWindow):
     def start(self):
         """Show the cached list immediately, then refresh it in the background."""
         self.gen += 1
+        self.loading_main = True
         self.spin.start()
         threading.Thread(target=self._worker, args=(self.gen, True), daemon=True).start()
 
     def reload(self, clear=True):
         self.gen += 1
+        self.loading_main = True
+        self.security = None
+        self.detail_cache.clear()
         self.spin.start()
         if clear:
             self.clear_queue()
@@ -763,6 +812,7 @@ class Win(Adw.ApplicationWindow):
 
     def _unchanged(self, gen):
         if gen == self.gen:
+            self.loading_main = False
             self.spin.stop()
         return False
 
@@ -784,12 +834,14 @@ class Win(Adw.ApplicationWindow):
         self.sort_all()
         self.refilter()
         if final:
+            self.loading_main = False
             self.spin.stop()
         return False
 
     def _load_failed(self, msg, gen=None):
         if gen is not None and gen != self.gen:
             return False
+        self.loading_main = False
         self.spin.stop()
         self.toast(f"Failed to load packages: {msg}")
         return False
@@ -821,13 +873,49 @@ class Win(Adw.ApplicationWindow):
             rows = [p for p in rows if p.pinned]
         elif mode == 5:
             rows = [p for p in rows if p in self.queue]
+        elif mode == 6:
+            if self.security is None:
+                self.fetch_security()
+                rows = []
+            else:
+                rows = [p for p in rows if (p.name, p.arch) in self.security]
         q = self.query
         if q:
             rows = [p for p in rows if q in p.hay]
         elif rows is self.all:
             rows = list(rows)
         self.model.set_rows(rows)
-        self.count.set_text(f"{len(rows)} packages")
+        loading = mode == 6 and self.security is None
+        self.count.set_text("Checking security advisories\u2026" if loading
+                            else f"{len(rows)} packages")
+
+    def fetch_security(self):
+        if self.security_loading:
+            return
+        self.security_loading = True
+        self.spin.start()
+        gen = self.gen
+
+        def work():
+            try:  # advisory data may be missing from the offline cache, so allow the network
+                rows = query("--upgrades", "--security", "--latest-limit=1", cache=False)
+            except Exception:
+                rows = []
+            GLib.idle_add(self._security_done, {(r[0], r[2]) for r in rows}, gen)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _security_done(self, keys, gen):
+        self.security_loading = False
+        if not self.loading_main:
+            self.spin.stop()
+        if gen == self.gen:
+            self.security = keys
+            if not keys:
+                self.toast("No security updates found (or advisory metadata unavailable)")
+        if self.mode.get_selected() == 6:
+            self.refilter()  # also re-fetches if a reload made this result stale
+        return False
 
     def on_search(self, entry):
         self.query = entry.get_text().strip().lower()
@@ -873,25 +961,47 @@ class Win(Adw.ApplicationWindow):
         if self.info_timer:
             GLib.source_remove(self.info_timer)
             self.info_timer = 0
+        self.cur = sel[0] if sel else None
         if not sel:
-            self.info.get_buffer().set_text("Select a package to see its details.")
+            for tv in self.tab_views:
+                tv.get_buffer().set_text("Select a package to see its details.")
             return
         # Debounce: holding an arrow key would otherwise spawn one dnf5 process per row.
-        self.info_timer = GLib.timeout_add(250, self._start_info, sel[0], self.info_token)
+        self.info_timer = GLib.timeout_add(250, self._start_info, self.cur, self.info_token)
 
     def _start_info(self, p, token):
         self.info_timer = 0
-
-        def work():
-            out = dnf5("info", p.spec)
-            GLib.idle_add(self.set_info, token, out)
-
-        threading.Thread(target=work, daemon=True).start()
+        self.load_tab(p, token, self.notebook.get_current_page())
         return False
 
-    def set_info(self, token, text):
+    def on_tab_switch(self, _nb, _page, num):
+        if self.cur is not None:
+            self.info_token += 1
+            self.load_tab(self.cur, self.info_token, num)
+
+    def load_tab(self, p, token, idx):
+        key = (p.spec, p.installed, idx)
+        buf = self.tab_views[idx].get_buffer()
+        if key in self.detail_cache:
+            buf.set_text(self.detail_cache[key])
+            return
+        buf.set_text("Loading\u2026")
+
+        def work():
+            try:
+                text = detail_text(p, idx)
+            except Exception as e:
+                text = f"Error: {e}"
+            GLib.idle_add(self.set_detail, token, idx, key, text)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def set_detail(self, token, idx, key, text):
+        if len(self.detail_cache) > 400:
+            self.detail_cache.clear()
+        self.detail_cache[key] = text
         if token == self.info_token:
-            self.info.get_buffer().set_text(text)
+            self.tab_views[idx].get_buffer().set_text(text)
         return False
 
     # ---- queue
