@@ -48,8 +48,17 @@ SO_CAP = re.compile(r"^([^()\s]+\.so[^()\s]*)\(.*\)$")
 COMPS_RE = re.compile(r"^(\S+)\s+(.+?)\s+(yes|no)\s*$")
 WIDE_ENV = {**os.environ, "COLUMNS": "1000"}  # keep dnf5 tables from truncating names
 MODES = ["All", "Installed", "Not installed", "Upgradable", "Queued changes",
-         "Security updates"]
-M_UPGRADABLE, M_QUEUED, M_SECURITY = 3, 4, 5
+         "Security updates", "User-installed", "Unneeded", "Leaves", "Extras"]
+M_UPGRADABLE, M_QUEUED, M_SECURITY, M_USER, M_UNNEEDED, M_LEAVES, M_EXTRAS = 3, 4, 5, 6, 7, 8, 9
+# Modes filled by one repoquery each, lazily: mode -> (flags, allow cache-only).
+# Advisory data may be missing from the offline cache, so security may go online.
+SET_QUERIES = {
+    M_SECURITY: (("--upgrades", "--security", "--latest-limit=1"), False),
+    M_USER: (("--installed", "--userinstalled"), True),
+    M_UNNEEDED: (("--installed", "--unneeded"), True),
+    M_LEAVES: (("--installed", "--leaves"), True),
+    M_EXTRAS: (("--installed", "--extras"), True),
+}
 
 
 # ---------------------------------------------------------------- data layer
@@ -883,8 +892,8 @@ class Win(Adw.ApplicationWindow):
         self.col_props = {}
         self.cur = None        # package shown in the details pane
         self.detail_cache = {}
-        self.security = None   # {(name, arch)} of packages with security upgrades, lazy
-        self.security_loading = False
+        self.sets = {}         # mode -> {(name, arch)} for the SET_QUERIES modes, lazy
+        self.set_loading = set()  # modes currently being queried
         self.loading_main = False
         self.checking = False  # a metadata refresh is running
         self.n_upg = 0         # packages with an upgrade available
@@ -1116,7 +1125,7 @@ class Win(Adw.ApplicationWindow):
         threading.Thread(target=work, daemon=True).start()
 
     def _quiet_done(self, done, rc, out, reload):
-        if not (self.loading_main or self.checking or self.security_loading):
+        if not (self.loading_main or self.checking or self.set_loading):
             self.spin.stop()
         if rc != 0:
             self.toast_details("Action failed", "Output", out)
@@ -1155,7 +1164,7 @@ class Win(Adw.ApplicationWindow):
     def reload(self, clear=True):
         self.gen += 1
         self.loading_main = True
-        self.security = None
+        self.sets.clear()
         self.detail_cache.clear()
         self.spin.start()
         if clear:
@@ -1319,47 +1328,50 @@ class Win(Adw.ApplicationWindow):
             rows = [p for p in rows if p.upgradable]
         elif mode == M_QUEUED:
             rows = [p for p in rows if p in self.queue]
-        elif mode == M_SECURITY:
-            if self.security is None:
-                self.fetch_security()
+        elif mode in SET_QUERIES:
+            keys = self.sets.get(mode)
+            if keys is None:
+                self.fetch_set(mode)
                 rows = []
             else:
-                rows = [p for p in rows if (p.name, p.arch) in self.security]
+                rows = [p for p in rows if (p.name, p.arch) in keys]
         q = self.query
         if q:
             rows = [p for p in rows if q in p.hay]
         elif rows is self.all:
             rows = list(rows)
         self.model.set_rows(rows)
-        loading = mode == M_SECURITY and self.security is None
+        loading = mode in SET_QUERIES and mode not in self.sets
         text = f"{len(rows)} packages" + (f" \u00b7 {self.n_upg} upgradable" if self.n_upg else "")
-        self.count.set_text("Checking security advisories\u2026" if loading else text)
+        self.count.set_text(("Checking security advisories\u2026" if mode == M_SECURITY
+                             else "Loading\u2026") if loading else text)
 
-    def fetch_security(self):
-        if self.security_loading:
+    def fetch_set(self, mode):
+        if mode in self.set_loading:
             return
-        self.security_loading = True
+        self.set_loading.add(mode)
         self.spin.start()
         gen = self.gen
+        flags, cache = SET_QUERIES[mode]
 
         def work():
-            try:  # advisory data may be missing from the offline cache, so allow the network
-                rows = query("--upgrades", "--security", "--latest-limit=1", cache=False)
+            try:
+                rows = query(*flags, cache=cache)
             except Exception:
                 rows = []
-            GLib.idle_add(self._security_done, {(r[0], r[2]) for r in rows}, gen)
+            GLib.idle_add(self._set_done, mode, {(r[0], r[2]) for r in rows}, gen)
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _security_done(self, keys, gen):
-        self.security_loading = False
-        if not self.loading_main:
+    def _set_done(self, mode, keys, gen):
+        self.set_loading.discard(mode)
+        if not self.loading_main and not self.set_loading:
             self.spin.stop()
         if gen == self.gen:
-            self.security = keys
-            if not keys:
+            self.sets[mode] = keys
+            if not keys and mode == M_SECURITY:
                 self.toast("No security updates found (or advisory metadata unavailable)")
-        if self.mode.get_selected() == M_SECURITY:
+        if self.mode.get_selected() in SET_QUERIES:
             self.refilter()  # also re-fetches if a reload made this result stale
         return False
 
