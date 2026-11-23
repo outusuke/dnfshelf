@@ -77,6 +77,22 @@ def query(*flags, cache=True):
     return rows
 
 
+def reboot_status():
+    """(required, packages) from `dnf5 needs-restarting`, or None if unavailable."""
+    try:
+        r = subprocess.run(["dnf5", "needs-restarting", "--json"], capture_output=True, text=True)
+        for o in json.loads(r.stdout):
+            if o.get("type") == "reboot":
+                return bool(o.get("reboot_required")), list(o.get("packages") or [])
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    try:  # older dnf5 without --json: exit code 1 means a reboot is recommended
+        r = subprocess.run(["dnf5", "needs-restarting"], capture_output=True, text=True)
+    except OSError:
+        return None
+    return (r.returncode == 1, []) if r.returncode in (0, 1) else None
+
+
 def parse_comps(text):
     """Parse `dnf5 group|environment list` into [(id, name, installed)] sorted by name."""
     out = []
@@ -369,6 +385,9 @@ class RunWindow(Adw.Window):
         hb.pack_end(self.retry_btn)
         tb = Adw.ToolbarView()
         tb.add_top_bar(hb)
+        self.banner = Adw.Banner(button_label="Reboot", revealed=False)
+        self.banner.connect("button-clicked", lambda *_: self.confirm_reboot())
+        tb.add_top_bar(self.banner)
         tb.set_content(Gtk.ScrolledWindow(vexpand=True, child=self.tv))
         self.set_content(tb)
         if dry:
@@ -870,6 +889,7 @@ class Win(Adw.ApplicationWindow):
         self.checking = False  # a metadata refresh is running
         self.n_upg = 0         # packages with an upgrade available
         self.after_load = None  # one-shot callback run when the next reload finishes
+        self.reboot_checking = False
 
         # header bar
         hb = Adw.HeaderBar()
@@ -1163,7 +1183,42 @@ class Win(Adw.ApplicationWindow):
             self._run_after_load()
         return False
 
+    def check_reboot(self):
+        if self.reboot_checking:
+            return
+        self.reboot_checking = True
+
+        def work():
+            st = reboot_status()
+            GLib.idle_add(self._reboot_checked, st)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _reboot_checked(self, st):
+        self.reboot_checking = False
+        if st and st[0]:
+            names = ", ".join(st[1][:3]) + (" and more" if len(st[1]) > 3 else "")
+            msg = "Reboot recommended to finish updates" + (f" ({names})" if names else "")
+            self.banner.set_title(GLib.markup_escape_text(msg))
+            self.banner.set_revealed(True)
+        else:
+            self.banner.set_revealed(False)
+        return False
+
+    def confirm_reboot(self):
+        dlg = Adw.AlertDialog(heading="Reboot now?",
+                              body="Save your work first. The system restarts immediately.")
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("reboot", "Reboot")
+        dlg.set_response_appearance("reboot", Adw.ResponseAppearance.DESTRUCTIVE)
+        dlg.set_default_response("cancel")
+        dlg.set_close_response("cancel")
+        dlg.connect("response", lambda _d, r: r == "reboot"
+                    and self.quiet("Rebooting…", ["systemctl", "reboot"], reload=False))
+        dlg.present(self)
+
     def _run_after_load(self):
+        self.check_reboot()
         cb, self.after_load = self.after_load, None
         if cb:
             cb()
