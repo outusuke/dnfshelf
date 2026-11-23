@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-DNF5 Package Manager: a Synaptic-style front end for Fedora (GTK4 + libadwaita).
+Dnfshelf: a Synaptic-style front end for Fedora (GTK4 + libadwaita).
 
 Dependencies:
     sudo dnf install python3-gobject gtk4 libadwaita dnf5 dnf5-plugins polkit
 
 Run:
-    python3 dnf5-manager.py
+    python3 dnfshelf.py
 
 Install to ~/.local/bin and the app menu (or use the menu entry inside the app):
-    python3 dnf5-manager.py --install
-    python3 dnf5-manager.py --uninstall
+    python3 dnfshelf.py --install
+    python3 dnfshelf.py --uninstall
 
 Everything goes through the dnf5 CLI. Privileged operations use pkexec, so you
 get one polkit prompt per transaction. Pins use `dnf5 versionlock`
@@ -34,14 +34,14 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango  # noqa: E402
 
-APP_ID = "org.example.Dnf5Manager"
+APP_ID = "org.example.Dnfshelf"
 VERSIONLOCK_FILE = "/etc/dnf/versionlock.toml"
 QF = r"%{name}|%{evr}|%{arch}|%{repoid}|%{summary}\n"
 # List packages from the local metadata cache (no network round trip on every start).
 # Falls back to a normal dnf5 run automatically if that fails. Use "Refresh repo
 # metadata" in the menu to update the cache.
 USE_CACHEONLY = True
-CACHE_DIR = os.path.join(GLib.get_user_cache_dir(), "dnf5-manager")
+CACHE_DIR = os.path.join(GLib.get_user_cache_dir(), "dnfshelf")
 CACHE_FILE = os.path.join(CACHE_DIR, "packages.json")
 PKG_QF = r"%{name}\n"
 SO_CAP = re.compile(r"^([^()\s]+\.so[^()\s]*)\(.*\)$")
@@ -894,7 +894,7 @@ class RepoWindow(Adw.Window):
 
 class Win(Adw.ApplicationWindow):
     def __init__(self, app):
-        super().__init__(application=app, title="DNF5 Package Manager",
+        super().__init__(application=app, title="Dnfshelf",
                          default_width=1250, default_height=780)
         self.model = PkgModel()
         self.all = []          # every package, kept sorted
@@ -1621,11 +1621,11 @@ class Win(Adw.ApplicationWindow):
                    ["pkexec", "dnf5", "mark", kind, *names], reload=False)
 
 
-BIN_PATH = os.path.expanduser("~/.local/bin/dnf5-manager")
+BIN_PATH = os.path.expanduser("~/.local/bin/dnfshelf")
 DESKTOP_PATH = os.path.expanduser(f"~/.local/share/applications/{APP_ID}.desktop")
 DESKTOP_ENTRY = """[Desktop Entry]
 Type=Application
-Name=DNF5 Package Manager
+Name=Dnfshelf
 Comment=Synaptic-style package manager for Fedora
 Exec="{exec}"
 Icon=system-software-install
