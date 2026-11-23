@@ -93,17 +93,6 @@ def comps_text(kind, sub, *specs, hidden=False):
     return dnf5(kind, sub, *flags, *specs, env=WIDE_ENV)
 
 
-REFRESH_NOTE = ("Refresh repository metadata for the system (needs root) and for your user "
-                "account.\nThis app reads the user cache, so both must be refreshed.")
-
-
-def refresh_argv():
-    """Refresh root's metadata cache, then the user cache that --cacheonly reads."""
-    step = "dnf5 clean metadata && dnf5 makecache"
-    root = shlex.join(["pkexec", "sh", "-c", step])
-    return ["sh", "-c", f"{root} && {step}"]
-
-
 def load_pins():
     try:
         with open(VERSIONLOCK_FILE, "rb") as f:
@@ -849,6 +838,7 @@ class Win(Adw.ApplicationWindow):
         self.security = None   # {(name, arch)} of packages with security upgrades, lazy
         self.security_loading = False
         self.loading_main = False
+        self.checking = False  # a metadata refresh is running
         self.n_upg = 0         # packages with an upgrade available
         self.after_load = None  # one-shot callback run when the next reload finishes
 
@@ -857,9 +847,10 @@ class Win(Adw.ApplicationWindow):
         self.mode = Gtk.DropDown.new_from_strings(MODES)
         self.mode.connect("notify::selected", lambda *_: self.refilter())
         hb.pack_start(self.mode)
-        check_btn = Gtk.Button(icon_name="view-refresh-symbolic", tooltip_text="Check for updates")
-        check_btn.connect("clicked", lambda *_: self.check_updates())
-        hb.pack_start(check_btn)
+        self.check_btn = Gtk.Button(icon_name="view-refresh-symbolic",
+                                    tooltip_text="Check for updates")
+        self.check_btn.connect("clicked", lambda *_: self.check_updates())
+        hb.pack_start(self.check_btn)
         self.spin = Gtk.Spinner()
         hb.pack_start(self.spin)
         self.search = Gtk.SearchEntry(placeholder_text="Search name or description",
@@ -1005,8 +996,7 @@ class Win(Adw.ApplicationWindow):
             self.add_action(a)
 
         add("reload", self.reload)
-        add("metadata", lambda: self.run_cmd(
-            "Refresh metadata", refresh_argv(), REFRESH_NOTE, reload=True))
+        add("metadata", lambda: self.check_updates(show=False))
         add("upgrade_all", self.upgrade_all)
         add("upgrade_security", self.upgrade_security)
         add("autoremove", lambda: self.run_cmd(
@@ -1116,18 +1106,41 @@ class Win(Adw.ApplicationWindow):
         if cb:
             cb()
 
-    def check_updates(self):
-        """Refresh repo metadata, reload the list, then show what can be upgraded."""
-        RunWindow(self, "Check for updates",
-                  refresh_argv(), REFRESH_NOTE + "\nThen the available updates are shown.",
-                  on_done=self._checked, autorun=True).present()
-
-    def _checked(self, rc):
-        if rc != 0:
-            self.toast("Metadata refresh failed")
+    def check_updates(self, show=True):
+        """Refresh the user metadata cache quietly (no password needed), then reload."""
+        if self.checking:
             return
-        self.after_load = self._show_updates
+        self.checking = True
+        self.check_btn.set_sensitive(False)
+        self.spin.start()
+
+        def work():
+            r = subprocess.run(["dnf5", "makecache", "--refresh"], capture_output=True, text=True)
+            GLib.idle_add(self._checked, r.returncode, r.stdout + r.stderr, show)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _checked(self, rc, out, show):
+        self.checking = False
+        self.check_btn.set_sensitive(True)
+        if rc != 0:
+            self.spin.stop()
+            t = Adw.Toast.new("Could not check for updates")
+            t.set_button_label("Details")
+            t.connect("button-clicked", lambda *_: self.show_output("Check for updates", out))
+            self.overlay.add_toast(t)
+            return False
+        self.after_load = self._show_updates if show else self._refreshed
         self.reload()
+        return False
+
+    def show_output(self, title, text):
+        w = RunWindow(self, title, [], text.strip() or "(no output)")
+        w.run_btn.set_visible(False)
+        w.present()
+
+    def _refreshed(self):
+        self.toast("Package list refreshed")
 
     def _show_updates(self):
         self.mode.set_selected(M_UPGRADABLE)
