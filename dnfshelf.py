@@ -396,9 +396,6 @@ class RunWindow(Adw.Window):
         hb.pack_end(self.retry_btn)
         tb = Adw.ToolbarView()
         tb.add_top_bar(hb)
-        self.banner = Adw.Banner(button_label="Reboot", revealed=False)
-        self.banner.connect("button-clicked", lambda *_: self.confirm_reboot())
-        tb.add_top_bar(self.banner)
         tb.set_content(Gtk.ScrolledWindow(vexpand=True, child=self.tv))
         self.set_content(tb)
         if dry:
@@ -978,6 +975,9 @@ class Win(Adw.ApplicationWindow):
 
         tb = Adw.ToolbarView()
         tb.add_top_bar(hb)
+        self.banner = Adw.Banner(button_label="Reboot", revealed=False)
+        self.banner.connect("button-clicked", lambda *_: self.confirm_reboot())
+        tb.add_top_bar(self.banner)
         tb.set_content(paned)
         self.overlay = Adw.ToastOverlay(child=tb)
         self.set_content(self.overlay)
