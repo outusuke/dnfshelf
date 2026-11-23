@@ -25,7 +25,7 @@ python3 dnfshelf.py
 - Details tabs: Info, Dependencies, Files, Changelog
 - Queue several changes, then apply them in one transaction: install, remove, upgrade, reinstall, downgrade
 - Dry run before Apply, Upgrade all and security-only upgrades
-- Pin, block or pin to a chosen version (`dnf5 versionlock`), with a window to review and remove pins
+- Pin or block a package (`dnf5 versionlock`), with a window to review and remove pins
 - Groups and environments: install (with optional packages) and remove
 - Repositories: enable, disable, add a local repo
 - Transaction history with undo and rollback
