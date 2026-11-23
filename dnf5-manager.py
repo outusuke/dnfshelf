@@ -837,12 +837,17 @@ class Win(Adw.ApplicationWindow):
         self.security = None   # {(name, arch)} of packages with security upgrades, lazy
         self.security_loading = False
         self.loading_main = False
+        self.n_upg = 0         # packages with an upgrade available
+        self.after_load = None  # one-shot callback run when the next reload finishes
 
         # header bar
         hb = Adw.HeaderBar()
         self.mode = Gtk.DropDown.new_from_strings(MODES)
         self.mode.connect("notify::selected", lambda *_: self.refilter())
         hb.pack_start(self.mode)
+        check_btn = Gtk.Button(icon_name="view-refresh-symbolic", tooltip_text="Check for updates")
+        check_btn.connect("clicked", lambda *_: self.check_updates())
+        hb.pack_start(check_btn)
         self.spin = Gtk.Spinner()
         hb.pack_start(self.spin)
         self.search = Gtk.SearchEntry(placeholder_text="Search name or description",
@@ -1092,13 +1097,39 @@ class Win(Adw.ApplicationWindow):
         if gen == self.gen:
             self.loading_main = False
             self.spin.stop()
+            self._run_after_load()
         return False
+
+    def _run_after_load(self):
+        cb, self.after_load = self.after_load, None
+        if cb:
+            cb()
+
+    def check_updates(self):
+        """Refresh repo metadata, reload the list, then show what can be upgraded."""
+        RunWindow(self, "Check for updates",
+                  ["pkexec", "sh", "-c", "dnf5 clean metadata && dnf5 makecache"],
+                  "Refresh repository metadata, then show available updates.",
+                  on_done=self._checked, autorun=True).present()
+
+    def _checked(self, rc):
+        if rc != 0:
+            self.toast("Metadata refresh failed")
+            return
+        self.after_load = self._show_updates
+        self.reload()
+
+    def _show_updates(self):
+        self.mode.set_selected(3)  # Upgradable
+        self.refilter()
+        self.toast(f"{self.n_upg} updates available" if self.n_upg else "System is up to date")
 
     def _loaded(self, objs, gen, final):
         if gen != self.gen:
             return False
         old = {(p.name, p.arch): p.actions for p in self.queue}
         self.all = objs
+        self.n_upg = sum(1 for p in objs if p.upgradable)
         self.queue = set()
         if old:  # keep queued actions across the cache -> fresh data swap
             for p in objs:
@@ -1114,12 +1145,14 @@ class Win(Adw.ApplicationWindow):
         if final:
             self.loading_main = False
             self.spin.stop()
+            self._run_after_load()
         return False
 
     def _load_failed(self, msg, gen=None):
         if gen is not None and gen != self.gen:
             return False
         self.loading_main = False
+        self.after_load = None
         self.spin.stop()
         self.toast(f"Failed to load packages: {msg}")
         return False
@@ -1164,8 +1197,8 @@ class Win(Adw.ApplicationWindow):
             rows = list(rows)
         self.model.set_rows(rows)
         loading = mode == 6 and self.security is None
-        self.count.set_text("Checking security advisories\u2026" if loading
-                            else f"{len(rows)} packages")
+        text = f"{len(rows)} packages" + (f" \u00b7 {self.n_upg} upgradable" if self.n_upg else "")
+        self.count.set_text("Checking security advisories\u2026" if loading else text)
 
     def fetch_security(self):
         if self.security_loading:
