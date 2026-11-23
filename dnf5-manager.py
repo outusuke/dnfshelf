@@ -52,12 +52,13 @@ MODES = ["All", "Installed", "Not installed", "Upgradable", "Queued changes",
 M_UPGRADABLE, M_QUEUED, M_SECURITY, M_USER, M_UNNEEDED, M_LEAVES, M_EXTRAS = 3, 4, 5, 6, 7, 8, 9
 # Modes filled by one repoquery each, lazily: mode -> (flags, allow cache-only).
 # Advisory data may be missing from the offline cache, so security may go online.
+# No --installed: --userinstalled rejects it, and these modes only show installed packages.
 SET_QUERIES = {
     M_SECURITY: (("--upgrades", "--security", "--latest-limit=1"), False),
-    M_USER: (("--installed", "--userinstalled"), True),
-    M_UNNEEDED: (("--installed", "--unneeded"), True),
-    M_LEAVES: (("--installed", "--leaves"), True),
-    M_EXTRAS: (("--installed", "--extras"), True),
+    M_USER: (("--userinstalled",), True),
+    M_UNNEEDED: (("--unneeded",), True),
+    M_LEAVES: (("--leaves",), True),
+    M_EXTRAS: (("--extras",), True),
 }
 
 
@@ -1334,7 +1335,7 @@ class Win(Adw.ApplicationWindow):
                 self.fetch_set(mode)
                 rows = []
             else:
-                rows = [p for p in rows if (p.name, p.arch) in keys]
+                rows = [p for p in rows if p.installed and (p.name, p.arch) in keys]
         q = self.query
         if q:
             rows = [p for p in rows if q in p.hay]
