@@ -45,22 +45,25 @@ CACHE_DIR = os.path.join(GLib.get_user_cache_dir(), "dnf5-manager")
 CACHE_FILE = os.path.join(CACHE_DIR, "packages.json")
 PKG_QF = r"%{name}\n"
 SO_CAP = re.compile(r"^([^()\s]+\.so[^()\s]*)\(.*\)$")
+COMPS_RE = re.compile(r"^(\S+)\s+(.+?)\s+(yes|no)\s*$")
+WIDE_ENV = {**os.environ, "COLUMNS": "1000"}  # keep dnf5 tables from truncating names
 MODES = ["All", "Installed", "Not installed", "Upgradable", "Pinned", "Queued changes",
          "Security updates"]
 
 
 # ---------------------------------------------------------------- data layer
-def run(argv):
-    return subprocess.run(argv, capture_output=True, text=True).stdout
+def run(argv, env=None):
+    return subprocess.run(argv, capture_output=True, text=True, env=env).stdout
 
 
-def dnf5(*args, cache=True):
+def dnf5(*args, cache=True, env=None):
     """Read-only dnf5 call, preferring the local metadata cache."""
     if USE_CACHEONLY and cache:
-        r = subprocess.run(["dnf5", "--cacheonly", *args], capture_output=True, text=True)
+        r = subprocess.run(["dnf5", "--cacheonly", *args], capture_output=True, text=True,
+                           env=env)
         if r.returncode == 0:
             return r.stdout
-    return run(["dnf5", *args])
+    return run(["dnf5", *args], env=env)
 
 
 def query(*flags, cache=True):
@@ -71,6 +74,22 @@ def query(*flags, cache=True):
         if len(parts) == 5:
             rows.append(parts)
     return rows
+
+
+def parse_comps(text):
+    """Parse `dnf5 group|environment list` into [(id, name, installed)] sorted by name."""
+    out = []
+    for line in text.splitlines():
+        m = COMPS_RE.match(line)
+        if m:
+            out.append((m.group(1), m.group(2), m.group(3) == "yes"))
+    return sorted(out, key=lambda t: (t[1].lower(), t[0]))
+
+
+def comps_text(kind, sub, *specs, hidden=False):
+    """Output of `dnf5 <group|environment> <list|info> [--hidden] [specs]`."""
+    flags = ["--hidden"] if hidden and kind == "group" else []
+    return dnf5(kind, sub, *flags, *specs, env=WIDE_ENV)
 
 
 def load_pins():
@@ -520,6 +539,182 @@ class PinsWindow(Adw.Window):
         self.parent_win.run_root("Remove all pins", [["dnf5", "versionlock", "clear"]])
 
 
+class CompsPage(Gtk.Box):
+    """List of comps groups or environments with info and install/remove."""
+
+    def __init__(self, win, kind):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin_top=8,
+                         margin_bottom=8, margin_start=12, margin_end=12)
+        self.win, self.kind = win, kind
+        self.items, self.row_ids, self.info_cache = {}, {}, {}
+        self.gen = self.token = 0
+        self.search = Gtk.SearchEntry(hexpand=True, placeholder_text="Filter by name or id")
+        self.search.connect("search-changed", lambda *_: self.listbox.invalidate_filter())
+        self.installed_only = Gtk.CheckButton(label="Installed only")
+        self.installed_only.connect("toggled", lambda *_: self.listbox.invalidate_filter())
+        top = Gtk.Box(spacing=12)
+        top.append(self.search)
+        top.append(self.installed_only)
+        self.hidden = None
+        if kind == "group":
+            self.hidden = Gtk.CheckButton(label="Show hidden")
+            self.hidden.connect("toggled", lambda *_: self.load())
+            top.append(self.hidden)
+        self.append(top)
+        self.listbox = Gtk.ListBox(selection_mode=Gtk.SelectionMode.SINGLE,
+                                   css_classes=["boxed-list"], valign=Gtk.Align.START)
+        self.listbox.set_filter_func(self._match)
+        self.listbox.set_placeholder(Gtk.Label(label="Loading\u2026", css_classes=["dim-label"],
+                                               margin_top=24, margin_bottom=24))
+        self.listbox.connect("row-selected", self.on_select)
+        self.info = Gtk.TextView(editable=False, monospace=True, left_margin=8, top_margin=8,
+                                 bottom_margin=8, wrap_mode=Gtk.WrapMode.WORD_CHAR)
+        paned = Gtk.Paned(orientation=Gtk.Orientation.VERTICAL, vexpand=True,
+                          position=300, shrink_start_child=False, shrink_end_child=False)
+        paned.set_start_child(Gtk.ScrolledWindow(child=self.listbox))
+        paned.set_end_child(Gtk.ScrolledWindow(child=self.info))
+        self.append(paned)
+        self.optional = Gtk.CheckButton(label="Include optional packages", hexpand=True,
+                                        halign=Gtk.Align.START)
+        self.remove_btn = Gtk.Button(label="Remove", css_classes=["destructive-action"],
+                                     sensitive=False)
+        self.remove_btn.connect("clicked", lambda *_: self.act("remove"))
+        self.install_btn = Gtk.Button(label="Install", css_classes=["suggested-action"],
+                                      sensitive=False)
+        self.install_btn.connect("clicked", lambda *_: self.act("install"))
+        bar = Gtk.Box(spacing=8)
+        bar.append(self.optional)
+        bar.append(self.remove_btn)
+        bar.append(self.install_btn)
+        self.append(bar)
+        self.load()
+
+    def hidden_on(self):
+        return bool(self.hidden and self.hidden.get_active())
+
+    def load(self):
+        self.gen += 1
+        gen, hidden = self.gen, self.hidden_on()
+
+        def work():
+            try:
+                items = parse_comps(comps_text(self.kind, "list", hidden=hidden))
+            except OSError:
+                items = []
+            GLib.idle_add(self._populate, items, gen)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _populate(self, items, gen):
+        if gen != self.gen:
+            return False
+        self.listbox.remove_all()
+        self.items = {i: (n, inst) for i, n, inst in items}
+        self.row_ids, self.info_cache = {}, {}
+        for gid, name, inst in items:
+            row = Adw.ActionRow(title=GLib.markup_escape_text(name),
+                                subtitle=GLib.markup_escape_text(gid))
+            if inst:
+                row.add_prefix(Gtk.Image.new_from_icon_name("object-select-symbolic"))
+            self.row_ids[row] = gid
+            self.listbox.append(row)
+        self.listbox.set_placeholder(Gtk.Label(
+            label="Nothing to show", css_classes=["dim-label"], margin_top=24, margin_bottom=24))
+        self.update_buttons()
+        return False
+
+    def _match(self, row):
+        name, inst = self.items[self.row_ids[row]]
+        if self.installed_only.get_active() and not inst:
+            return False
+        q = self.search.get_text().strip().lower()
+        return not q or q in name.lower() or q in self.row_ids[row].lower()
+
+    def selected_id(self):
+        row = self.listbox.get_selected_row()
+        return self.row_ids.get(row) if row else None
+
+    def update_buttons(self):
+        gid = self.selected_id()
+        inst = self.items[gid][1] if gid in self.items else None
+        self.install_btn.set_sensitive(inst is False)
+        self.remove_btn.set_sensitive(inst is True)
+
+    def on_select(self, _lb, row):
+        self.token += 1
+        self.update_buttons()
+        gid = self.row_ids.get(row) if row else None
+        if gid is None:
+            self.info.get_buffer().set_text("")
+        elif gid in self.info_cache:
+            self.info.get_buffer().set_text(self.info_cache[gid])
+        else:
+            self.info.get_buffer().set_text("Loading\u2026")
+            GLib.timeout_add(250, self._start_info, gid, self.token)
+
+    def _start_info(self, gid, tok):
+        if tok == self.token:
+            args = (gid, tok, self.hidden_on())
+            threading.Thread(target=self._info_worker, args=args, daemon=True).start()
+        return False
+
+    def _info_worker(self, gid, tok, hidden):
+        text = comps_text(self.kind, "info", gid, hidden=hidden).strip() or "(no information)"
+        GLib.idle_add(self._info_done, gid, tok, text)
+
+    def _info_done(self, gid, tok, text):
+        self.info_cache[gid] = text
+        if tok == self.token:
+            self.info.get_buffer().set_text(text)
+        return False
+
+    def act(self, verb):
+        gid = self.selected_id()
+        if gid is None:
+            return
+        optional = verb == "install" and self.optional.get_active()
+        kind = self.kind
+
+        def build(erase):
+            cmd = ["dnf5", "-y", kind, verb, gid]
+            if optional:
+                cmd.append("--with-optional")
+            if erase:
+                cmd.append("--allowerasing")
+            dry = [c for c in cmd if c != "-y"] + ["--assumeno"]
+            preview = shlex.join(cmd) + "\n\nThe dry run below shows what will change."
+            return ["pkexec", *cmd], preview, [dry]
+
+        argv, preview, dry = build(False)
+        title = f"{verb.capitalize()} {self.items[gid][0]}"
+        RunWindow(self.win, title, argv, preview, on_done=lambda rc: self.win.refresh_all(),
+                  dry=dry, rebuild=build if verb == "install" else None).present()
+
+
+class GroupsWindow(Adw.Window):
+    """Package groups and environments (dnf5 group / dnf5 environment)."""
+
+    def __init__(self, parent):
+        super().__init__(transient_for=parent, modal=True, title="Groups and environments",
+                         default_width=760, default_height=680)
+        self.parent_win = parent
+        self.pages = [CompsPage(self, "group"), CompsPage(self, "environment")]
+        stack = Adw.ViewStack()
+        stack.add_titled(self.pages[0], "group", "Groups")
+        stack.add_titled(self.pages[1], "environment", "Environments")
+        hb = Adw.HeaderBar()
+        hb.set_title_widget(Adw.ViewSwitcher(policy=Adw.ViewSwitcherPolicy.WIDE, stack=stack))
+        tb = Adw.ToolbarView()
+        tb.add_top_bar(hb)
+        tb.set_content(stack)
+        self.set_content(tb)
+
+    def refresh_all(self):
+        for page in self.pages:
+            page.load()
+        self.parent_win.reload()
+
+
 class RepoWindow(Adw.Window):
     """Enable/disable repositories and add local (file://) repositories."""
 
@@ -775,7 +970,7 @@ class Win(Adw.ApplicationWindow):
             [("Mark selected as user-installed", "mark_user"),
              ("Mark selected as dependency", "mark_auto")],
             [("Transaction history", "history"), ("Repositories", "repos"),
-             ("Pinned packages", "pins")],
+             ("Pinned packages", "pins"), ("Groups and environments", "groups")],
             [("Install to app menu", "install_launcher"),
              ("Remove from app menu", "remove_launcher")],
         ]
@@ -807,6 +1002,7 @@ class Win(Adw.ApplicationWindow):
         add("history", lambda: HistoryWindow(self).present())
         add("repos", lambda: RepoWindow(self).present())
         add("pins", lambda: PinsWindow(self).present())
+        add("groups", lambda: GroupsWindow(self).present())
         add("install_launcher", lambda: self.launcher(install_launcher))
         add("remove_launcher", lambda: self.launcher(uninstall_launcher))
         mark = Gio.SimpleAction.new("mark", GLib.VariantType.new("s"))
