@@ -93,6 +93,17 @@ def comps_text(kind, sub, *specs, hidden=False):
     return dnf5(kind, sub, *flags, *specs, env=WIDE_ENV)
 
 
+REFRESH_NOTE = ("Refresh repository metadata for the system (needs root) and for your user "
+                "account.\nThis app reads the user cache, so both must be refreshed.")
+
+
+def refresh_argv():
+    """Refresh root's metadata cache, then the user cache that --cacheonly reads."""
+    step = "dnf5 clean metadata && dnf5 makecache"
+    root = shlex.join(["pkexec", "sh", "-c", step])
+    return ["sh", "-c", f"{root} && {step}"]
+
+
 def load_pins():
     try:
         with open(VERSIONLOCK_FILE, "rb") as f:
@@ -995,8 +1006,7 @@ class Win(Adw.ApplicationWindow):
 
         add("reload", self.reload)
         add("metadata", lambda: self.run_cmd(
-            "Refresh metadata", ["pkexec", "sh", "-c", "dnf5 clean metadata && dnf5 makecache"],
-            "Refresh repository metadata", reload=True))
+            "Refresh metadata", refresh_argv(), REFRESH_NOTE, reload=True))
         add("upgrade_all", self.upgrade_all)
         add("upgrade_security", self.upgrade_security)
         add("autoremove", lambda: self.run_cmd(
@@ -1109,8 +1119,7 @@ class Win(Adw.ApplicationWindow):
     def check_updates(self):
         """Refresh repo metadata, reload the list, then show what can be upgraded."""
         RunWindow(self, "Check for updates",
-                  ["pkexec", "sh", "-c", "dnf5 clean metadata && dnf5 makecache"],
-                  "Refresh repository metadata, then show available updates.",
+                  refresh_argv(), REFRESH_NOTE + "\nThen the available updates are shown.",
                   on_done=self._checked, autorun=True).present()
 
     def _checked(self, rc):
