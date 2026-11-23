@@ -224,7 +224,15 @@ class RepoWindow(Adw.Window):
                                margin_start=12, margin_end=12, valign=Gtk.Align.START)
         tb = Adw.ToolbarView()
         tb.add_top_bar(hb)
-        tb.set_content(Gtk.ScrolledWindow(vexpand=True, child=self.box))
+        self.search = Gtk.SearchEntry(placeholder_text="Filter repositories",
+                                      margin_top=12, margin_start=12, margin_end=12)
+        self.search.connect("search-changed", lambda *_: self.box.invalidate_filter())
+        self.box.set_filter_func(self._filter)
+        self.box.set_sort_func(self._sort)
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        body.append(self.search)
+        body.append(Gtk.ScrolledWindow(vexpand=True, child=self.box))
+        tb.set_content(body)
         self.overlay = Adw.ToastOverlay(child=tb)
         self.set_content(self.overlay)
         threading.Thread(target=self._load, daemon=True).start()
@@ -238,6 +246,7 @@ class RepoWindow(Adw.Window):
         self.rows = {}
         for rid, name, enabled in repos:
             row = Adw.SwitchRow(title=rid, subtitle=name, active=enabled)
+            row.rid, row.orig = rid, enabled
             row.connect("notify::active", lambda *_: self.on_toggle())
             self.box.append(row)
             self.rows[rid] = (row, enabled)
@@ -249,6 +258,15 @@ class RepoWindow(Adw.Window):
 
     def on_toggle(self):
         self.save_btn.set_sensitive(bool(self.changes()))
+
+    def _filter(self, row):
+        q = self.search.get_text().strip().lower()
+        return not q or q in f"{row.rid} {row.get_subtitle()}".lower()
+
+    def _sort(self, a, b):
+        # enabled repos first (by original state, so rows don't jump on toggle), then by id
+        ka, kb = (not a.orig, a.rid.lower()), (not b.orig, b.rid.lower())
+        return (ka > kb) - (ka < kb)
 
     def apply(self):
         cmds = [["dnf5", "config-manager", "setopt", f"{rid}.enabled={int(on)}"]
