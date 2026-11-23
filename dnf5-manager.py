@@ -104,6 +104,20 @@ def parse_repos(text):
     return repos
 
 
+HISTORY_RE = re.compile(
+    r"^\s*(\d+)\s+(.*?)\s+(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s+(.*?)\s*$")
+
+
+def parse_history(text):
+    """Parse `dnf5 history list` into [(id, command line, date/time, actions)]."""
+    out = []
+    for line in text.splitlines():
+        m = HISTORY_RE.match(line)
+        if m:
+            out.append((int(m.group(1)), m.group(2), m.group(3), " ".join(m.group(4).split())))
+    return out
+
+
 class Pkg(GObject.Object):
     __gtype_name__ = "Dnf5Pkg"
     name = GObject.Property(type=str, default="")
@@ -227,6 +241,65 @@ class RunWindow(Adw.Window):
 
 
 # ---------------------------------------------------------------- main window
+class HistoryWindow(Adw.Window):
+    """Native transaction history with details, undo and rollback."""
+
+    def __init__(self, parent):
+        super().__init__(transient_for=parent, modal=True, title="Transaction history",
+                         default_width=760, default_height=600)
+        self.parent_win = parent
+        self.placeholder = Gtk.Label(label="Loading\u2026", css_classes=["dim-label"],
+                                     margin_top=48, margin_bottom=48)
+        self.box = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE,
+                               css_classes=["boxed-list"], margin_top=12, margin_bottom=12,
+                               margin_start=12, margin_end=12, valign=Gtk.Align.START)
+        self.box.set_placeholder(self.placeholder)
+        tb = Adw.ToolbarView()
+        tb.add_top_bar(Adw.HeaderBar())
+        tb.set_content(Gtk.ScrolledWindow(vexpand=True, child=self.box))
+        self.set_content(tb)
+        threading.Thread(target=self._load, daemon=True).start()
+
+    def _load(self):
+        GLib.idle_add(self._populate, parse_history(run(["dnf5", "history", "list"])))
+
+    def _populate(self, items):
+        self.placeholder.set_text("No transactions found")
+        for tid, cmd, when, actions in items:
+            row = Adw.ActionRow(title=GLib.markup_escape_text(cmd or "(no command line)"),
+                                subtitle=GLib.markup_escape_text(f"#{tid} \u00b7 {when} \u00b7 {actions}"),
+                                activatable=True)
+            row.connect("activated", lambda _r, t=tid: self.details(t))
+            for icon, tip, fn in (
+                    ("edit-undo-symbolic", "Undo this transaction", self.undo),
+                    ("document-revert-symbolic", "Roll back to the state after this one",
+                     self.rollback)):
+                b = Gtk.Button(icon_name=icon, tooltip_text=tip, valign=Gtk.Align.CENTER,
+                               css_classes=["flat"])
+                b.connect("clicked", lambda _b, t=tid, f=fn: f(t))
+                row.add_suffix(b)
+            self.box.append(row)
+        return False
+
+    def details(self, tid):
+        RunWindow(self, f"Transaction {tid}", ["dnf5", "history", "info", str(tid)],
+                  f"dnf5 history info {tid}", autorun=True).present()
+
+    def _transact(self, verb, tid):
+        self.close()
+        self.parent_win.run_cmd(
+            f"{verb.capitalize()} transaction {tid}",
+            ["pkexec", "dnf5", "-y", "history", verb, str(tid)],
+            f"dnf5 -y history {verb} {tid} (as root)\n\nThe dry run below shows what would change.",
+            reload=True, dry=[["dnf5", "history", verb, str(tid), "--assumeno"]])
+
+    def undo(self, tid):
+        self._transact("undo", tid)
+
+    def rollback(self, tid):
+        self._transact("rollback", tid)
+
+
 class PinsWindow(Adw.Window):
     """Native list of versionlock entries with per-row remove."""
 
@@ -516,8 +589,7 @@ class Win(Adw.ApplicationWindow):
             "Clean caches", ["pkexec", "dnf5", "clean", "all"], "dnf5 clean all"))
         add("mark_user", lambda: self.mark_selected("install", "user-installed"))
         add("mark_auto", lambda: self.mark_selected("remove", "dependency"))
-        add("history", lambda: self.run_cmd(
-            "History", ["dnf5", "history", "list"], "dnf5 history list", autorun=True))
+        add("history", lambda: HistoryWindow(self).present())
         add("repos", lambda: RepoWindow(self).present())
         add("pins", lambda: PinsWindow(self).present())
         add("install_launcher", lambda: self.launcher(install_launcher))
