@@ -26,7 +26,7 @@ python3 dnfshelf.py
 - Queue several changes, then apply them in one transaction: install, remove, upgrade, reinstall, downgrade
 - Dry run before Apply, Upgrade all and security-only upgrades
 - Pin or block a package (`dnf5 versionlock`), with a window to review and remove pins
-- Automatic updates through `dnf5 automatic`: check, download or install, all or security only, restart policy
+- Automatic updates through `dnf5 automatic`: check, download or install, all or security only, restart policy, plus GNOME Software's automatic download switch
 - Groups and environments: install (with optional packages) and remove
 - Repositories: enable, disable, add a local repo
 - Transaction history with undo and rollback

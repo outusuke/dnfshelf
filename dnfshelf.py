@@ -52,6 +52,8 @@ AUTO_MODE_HINTS = ["Only reports what is available",
                    "Installs updates without asking"]
 AUTO_SCOPES = {"default": "All updates", "security": "Security updates only"}
 AUTO_REBOOTS = {"never": "Never", "when-needed": "When needed", "when-changed": "After any update"}
+GS_NOTE = "Separate from the timer above. It also covers Flatpaks, which dnf5 automatic does not."
+GS_BOTH = "Both are on and will update the same packages. Turn one off."
 QF = r"%{name}|%{evr}|%{arch}|%{repoid}|%{summary}\n"
 # List packages from the local metadata cache (no network round trip on every start).
 # Falls back to a normal dnf5 run automatically if that fails. Use "Refresh repo
@@ -220,6 +222,15 @@ def timer_state():
     except OSError:
         return False, False, ""
     return have, enabled, nxt
+
+
+def gnome_software_settings():
+    """GNOME Software's settings, or None when it isn't installed (a missing schema would abort)."""
+    src = Gio.SettingsSchemaSource.get_default()
+    schema = src and src.lookup("org.gnome.software", True)
+    if schema and schema.has_key("download-updates"):
+        return Gio.Settings.new_full(schema, None, None)
+    return None
 
 
 def collect_raw():
@@ -678,9 +689,11 @@ class AutoUpdatesWindow(Adw.Window):
         self.parent_win = parent
         have, enabled, nxt = timer_state()
         cfg = automatic_settings()
+        self.gs = gnome_software_settings()
         self.scopes = list(AUTO_SCOPES) + [v for v in [cfg["scope"]] if v not in AUTO_SCOPES]
         self.reboots = list(AUTO_REBOOTS) + [v for v in [cfg["reboot"]] if v not in AUTO_REBOOTS]
         self.loaded = {"enabled": enabled, "mode": cfg["mode"],
+                       "gnome": bool(self.gs and self.gs.get_boolean("download-updates")),
                        "scope": self.scopes.index(cfg["scope"]),
                        "reboot": self.reboots.index(cfg["reboot"])}
 
@@ -727,6 +740,13 @@ class AutoUpdatesWindow(Adw.Window):
         for grp in (sched, what, restart):
             grp.set_sensitive(have)
             page.add(grp)
+        if self.gs:
+            self.gs_row = Adw.SwitchRow(title="Download updates automatically",
+                                        subtitle="GNOME Software", active=self.loaded["gnome"])
+            self.gs_row.connect("notify::active", lambda *_: self.refresh())
+            self.gs_group = Adw.PreferencesGroup(title="GNOME Software", description=GS_NOTE)
+            self.gs_group.add(self.gs_row)
+            page.add(self.gs_group)
         tb = Adw.ToolbarView()
         tb.add_top_bar(hb)
         tb.set_content(page)
@@ -742,12 +762,15 @@ class AutoUpdatesWindow(Adw.Window):
 
     def current(self):
         return {"enabled": self.sw.get_active(), "mode": self.mode_row.get_selected(),
-                "scope": self.scope_row.get_selected(), "reboot": self.reboot_row.get_selected()}
+                "scope": self.scope_row.get_selected(), "reboot": self.reboot_row.get_selected(),
+                "gnome": bool(self.gs and self.gs_row.get_active())}
 
     def refresh(self):
         now = self.current()
         self.mode_row.set_subtitle(AUTO_MODE_HINTS[now["mode"]])
         self.reboot_row.set_sensitive(now["mode"] == 2)
+        if self.gs:
+            self.gs_group.set_description(GS_BOTH if now["enabled"] and now["gnome"] else GS_NOTE)
         self.apply_btn.set_sensitive(now != self.loaded)
 
     def apply(self):
@@ -759,6 +782,8 @@ class AutoUpdatesWindow(Adw.Window):
             vals["upgrade_type"] = self.scopes[now["scope"]]
         if now["reboot"] != self.loaded["reboot"]:
             vals["reboot"] = self.reboots[now["reboot"]]
+        if self.gs and now["gnome"] != self.loaded["gnome"]:
+            self.gs.set_boolean("download-updates", now["gnome"])
         cmds = []
         if vals:
             try:
@@ -775,7 +800,10 @@ class AutoUpdatesWindow(Adw.Window):
         if now["enabled"] != self.loaded["enabled"]:
             cmds.append(["systemctl", "enable" if now["enabled"] else "disable", "--now", AUTO_TIMER])
         self.close()
-        self.parent_win.run_root("Automatic updates saved", cmds)
+        if cmds:
+            self.parent_win.run_root("Automatic updates saved", cmds)
+        else:
+            self.parent_win.toast("Automatic updates saved")
 
     def install_plugin(self):
         self.close()
