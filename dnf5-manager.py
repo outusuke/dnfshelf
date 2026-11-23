@@ -61,6 +61,24 @@ def load_pins():
         return set()
 
 
+def load_pin_entries():
+    """[(name, readable conditions)] from the dnf5 versionlock file."""
+    try:
+        with open(VERSIONLOCK_FILE, "rb") as f:
+            data = tomllib.load(f)
+    except Exception:
+        return []
+    out = []
+    for p in data.get("packages", []):
+        if "name" not in p:
+            continue
+        conds = ", ".join(
+            f'{c.get("key", "?")} {c.get("comparator", "?")} {c.get("value", "?")}'
+            for c in p.get("conditions", []))
+        out.append((p["name"], conds or "locked"))
+    return sorted(out)
+
+
 def collect_packages():
     pk = {}
     for n, e, a, r, s in query("--available", "--latest-limit=1"):
@@ -209,6 +227,49 @@ class RunWindow(Adw.Window):
 
 
 # ---------------------------------------------------------------- main window
+class PinsWindow(Adw.Window):
+    """Native list of versionlock entries with per-row remove."""
+
+    def __init__(self, parent):
+        super().__init__(transient_for=parent, modal=True, title="Pinned packages",
+                         default_width=640, default_height=520)
+        self.parent_win = parent
+        hb = Adw.HeaderBar()
+        clear = Gtk.Button(label="Remove all", css_classes=["destructive-action"])
+        clear.connect("clicked", lambda *_: self.remove_all())
+        hb.pack_start(clear)
+        box = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE, css_classes=["boxed-list"],
+                          margin_top=12, margin_bottom=12, margin_start=12, margin_end=12,
+                          valign=Gtk.Align.START)
+        entries = load_pin_entries()
+        clear.set_sensitive(bool(entries))
+        for name, detail in entries:
+            row = Adw.ActionRow(title=GLib.markup_escape_text(name),
+                                subtitle=GLib.markup_escape_text(detail))
+            btn = Gtk.Button(icon_name="user-trash-symbolic", valign=Gtk.Align.CENTER,
+                             css_classes=["flat"], tooltip_text="Remove pin")
+            btn.connect("clicked", lambda _b, n=name: self.remove(n))
+            row.add_suffix(btn)
+            box.append(row)
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        if not entries:
+            body.append(Gtk.Label(label="No pinned packages", css_classes=["dim-label"],
+                                  margin_top=48))
+        body.append(box)
+        tb = Adw.ToolbarView()
+        tb.add_top_bar(hb)
+        tb.set_content(Gtk.ScrolledWindow(vexpand=True, child=body))
+        self.set_content(tb)
+
+    def remove(self, name):
+        self.close()
+        self.parent_win.run_root("Remove pin", [["dnf5", "versionlock", "delete", name]])
+
+    def remove_all(self):
+        self.close()
+        self.parent_win.run_root("Remove all pins", [["dnf5", "versionlock", "clear"]])
+
+
 class RepoWindow(Adw.Window):
     """Enable/disable repositories and add local (file://) repositories."""
 
@@ -251,8 +312,9 @@ class RepoWindow(Adw.Window):
             self.box.remove(row)
         self.rows = {}
         for rid, name, enabled in repos:
-            row = Adw.SwitchRow(title=rid, subtitle=name, active=enabled)
-            row.rid, row.orig = rid, enabled
+            row = Adw.SwitchRow(title=GLib.markup_escape_text(rid),
+                                subtitle=GLib.markup_escape_text(name), active=enabled)
+            row.rid, row.rname, row.orig = rid, name, enabled
             row.connect("notify::active", lambda *_: self.on_toggle())
             self.box.append(row)
             self.rows[rid] = (row, enabled)
@@ -267,7 +329,7 @@ class RepoWindow(Adw.Window):
 
     def _filter(self, row):
         q = self.search.get_text().strip().lower()
-        return not q or q in f"{row.rid} {row.get_subtitle()}".lower()
+        return not q or q in f"{row.rid} {row.rname}".lower()
 
     def _sort(self, a, b):
         # enabled repos first (by original state, so rows don't jump on toggle), then by id
@@ -359,9 +421,13 @@ class Win(Adw.ApplicationWindow):
 
         # bottom: actions + info
         bar = Gtk.Box(spacing=6, margin_top=6, margin_bottom=6, margin_start=6, margin_end=6)
-        for label, act in [("Install", "install"), ("Remove", "remove"),
-                           ("Upgrade", "upgrade"), ("Pin version", "pin"), ("Unpin", "unpin")]:
-            b = Gtk.Button(label=label)
+        for label, act, tip in [
+                ("Install", "install", None), ("Remove", "remove", None),
+                ("Upgrade", "upgrade", None),
+                ("Pin version", "pin", "Lock the installed version (dnf5 versionlock add)"),
+                ("Unpin", "unpin", "Remove the lock or block (dnf5 versionlock delete)"),
+                ("Block", "block", "Exclude all versions (dnf5 versionlock exclude)")]:
+            b = Gtk.Button(label=label, tooltip_text=tip)
             b.connect("clicked", lambda _b, a=act: self.mark(a))
             bar.append(b)
         clear = Gtk.Button(label="Clear queue")
@@ -421,7 +487,7 @@ class Win(Adw.ApplicationWindow):
             [("Mark selected as user-installed", "mark_user"),
              ("Mark selected as dependency", "mark_auto")],
             [("Transaction history", "history"), ("Repositories", "repos"),
-             ("Show all pins", "pins")],
+             ("Pinned packages", "pins")],
             [("Install to app menu", "install_launcher"),
              ("Remove from app menu", "remove_launcher")],
         ]
@@ -453,8 +519,7 @@ class Win(Adw.ApplicationWindow):
         add("history", lambda: self.run_cmd(
             "History", ["dnf5", "history", "list"], "dnf5 history list", autorun=True))
         add("repos", lambda: RepoWindow(self).present())
-        add("pins", lambda: self.run_cmd(
-            "Pins", ["dnf5", "versionlock", "list"], "dnf5 versionlock list", autorun=True))
+        add("pins", lambda: PinsWindow(self).present())
         add("install_launcher", lambda: self.launcher(install_launcher))
         add("remove_launcher", lambda: self.launcher(uninstall_launcher))
 
@@ -561,9 +626,10 @@ class Win(Adw.ApplicationWindow):
             "upgrade": p.installed and p.upgradable,
             "pin": p.installed and not p.pinned,
             "unpin": p.pinned,
+            "block": not p.pinned,
         }[action]
         group = {"install", "remove", "upgrade"} if action in ("install", "remove", "upgrade") \
-            else {"pin", "unpin"}
+            else {"pin", "unpin", "block"}
         for p in self.selected():
             if action in p.actions:
                 p.actions.discard(action)
@@ -606,6 +672,8 @@ class Win(Adw.ApplicationWindow):
             cmds.append(["dnf5", "-y", "upgrade", *[p.spec for p in by("upgrade")]])
         if by("pin"):
             cmds.append(["dnf5", "versionlock", "add", *[p.name for p in by("pin")]])
+        if by("block"):
+            cmds.append(["dnf5", "versionlock", "exclude", *[p.name for p in by("block")]])
         if not cmds:
             return
         script = " && ".join(shlex.join(c) for c in cmds)
