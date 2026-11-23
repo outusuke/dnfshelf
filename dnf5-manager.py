@@ -43,6 +43,8 @@ QF = r"%{name}|%{evr}|%{arch}|%{repoid}|%{summary}\n"
 USE_CACHEONLY = True
 CACHE_DIR = os.path.join(GLib.get_user_cache_dir(), "dnf5-manager")
 CACHE_FILE = os.path.join(CACHE_DIR, "packages.json")
+PKG_QF = r"%{name}\n"
+SO_CAP = re.compile(r"^([^()\s]+\.so[^()\s]*)\(.*\)$")
 MODES = ["All", "Installed", "Not installed", "Upgradable", "Pinned", "Queued changes",
          "Security updates"]
 
@@ -124,6 +126,15 @@ def build_pkgs(raw):
     return [Pkg(d, d[0] in pins) for d in raw]
 
 
+def _fold_cap(c):
+    """One readable line per library; drop rpm/loader internals."""
+    c = c.strip()
+    if not c or c.startswith(("rpmlib(", "rtld(")):
+        return ""
+    m = SO_CAP.match(c)
+    return m.group(1) if m else c
+
+
 def _section(title, items, limit=300):
     out = [f"{title} ({len(items)}):"]
     out += [f"  {x}" for x in items[:limit]]
@@ -138,12 +149,23 @@ def detail_text(p, idx):
     if idx == 0:
         return dnf5("info", p.spec) or "No information available."
     if idx == 1:
-        req = sorted(set(dnf5("repoquery", *scope, "--requires", p.spec).split("\n")) - {""})
-        by = dnf5("repoquery", *scope, "--whatrequires", p.name,
-                  "--queryformat", r"%{name}.%{arch}\n")
-        by = sorted(set(by.split("\n")) - {""} - {p.spec})
-        return (_section("Requires", req) + "\n\n" +
-                _section("Required by (packages that require this package by name)", by))
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            f_req = ex.submit(dnf5, "repoquery", *scope, "--requires", p.spec)
+            f_pk = ex.submit(dnf5, "repoquery", *scope, "--providers-of=requires",
+                             "--queryformat", PKG_QF, p.spec)
+            f_prov = ex.submit(dnf5, "repoquery", *scope, "--provides", p.spec)
+            req, pk, prov = f_req.result(), f_pk.result(), f_prov.result()
+        needs = sorted(set(pk.split("\n")) - {""} - {p.name})
+        caps = sorted({c for c in map(_fold_cap, req.split("\n")) if c})
+        mine = sorted({c.split(" ")[0] for c in prov.split("\n") if c.strip()})[:500]
+        by = []
+        if mine:  # dependents that need anything this package provides, not just its name
+            out = dnf5("repoquery", *scope, "--whatrequires=" + ",".join(mine),
+                       "--queryformat", PKG_QF)
+            by = sorted(set(out.split("\n")) - {""} - {p.name})
+        return "\n\n".join([_section("Depends on (packages)", needs),
+                            _section("Requires (libraries and capabilities)", caps),
+                            _section("Required by (packages)", by)])
     out = dnf5("repoquery", *scope, "--files", p.spec)
     if not out.strip() and not p.installed:  # filelists metadata may not be cached yet
         out = dnf5("repoquery", *scope, "--files", p.spec, cache=False)
