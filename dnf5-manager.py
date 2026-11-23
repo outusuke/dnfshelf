@@ -103,6 +103,17 @@ def reboot_status():
     return (r.returncode == 1, []) if r.returncode in (0, 1) else None
 
 
+def _ver_key(v):
+    return [(0, int(x), "") if x.isdigit() else (1, 0, x) for x in re.split(r"(\d+)", v) if x]
+
+
+def pkg_versions(name, arch):
+    """Installed and available versions (evr) of one package, newest first."""
+    rows = query("--available", "--installed", name)
+    return sorted({r[1] for r in rows if r[0] == name and r[2] == arch},
+                  key=_ver_key, reverse=True)
+
+
 def parse_comps(text):
     """Parse `dnf5 group|environment list` into [(id, name, installed)] sorted by name."""
     out = []
@@ -291,11 +302,13 @@ ACTIONS = {
     "downgrade": ("Downgrade", "Install the next older available version (dnf5 downgrade)"),
     "pin": ("Pin version", "Lock the installed version (dnf5 versionlock add)"),
     "unpin": ("Unpin", "Remove the lock or block (dnf5 versionlock delete)"),
+    "pinver": ("Pin to version\u2026", "Lock a version you choose (dnf5 versionlock add name-version)"),
     "block": ("Block", "Exclude the versions currently available (dnf5 versionlock exclude)"),
 }
 
 
 CHANGE_ACTIONS = {"install", "remove", "upgrade", "reinstall", "downgrade"}
+PIN_ACTIONS = {"pin", "unpin", "block", "pinver"}
 
 
 def action_valid(p, action):
@@ -307,6 +320,7 @@ def action_valid(p, action):
         "downgrade": p.installed,
         "pin": p.installed and not p.pinned,
         "unpin": p.pinned,
+        "pinver": not p.pinned,
         "block": not p.pinned,
     }[action]
 
@@ -323,6 +337,7 @@ class Pkg(GObject.Object):
         self.upgradable = bool(upg)
         self.pinned = pinned
         self.actions = set()
+        self.pin_to = ""  # version chosen for the "pinver" action
         self.version = self.inst or self.latest
         self.hay = f"{self.name} {self.summary}".lower()
         self.status = self.queued = ""
@@ -1274,13 +1289,13 @@ class Win(Adw.ApplicationWindow):
     def _loaded(self, objs, gen, final):
         if gen != self.gen:
             return False
-        old = {(p.name, p.arch): p.actions for p in self.queue}
+        old = {(p.name, p.arch): (p.actions, p.pin_to) for p in self.queue}
         self.all = objs
         self.n_upg = sum(1 for p in objs if p.upgradable)
         self.queue = set()
         if old:  # keep queued actions across the cache -> fresh data swap
             for p in objs:
-                acts = old.get((p.name, p.arch))
+                acts, p.pin_to = old.get((p.name, p.arch), (None, ""))
                 if acts:
                     p.actions = {a for a in acts if action_valid(p, a)}
                     if p.actions:
@@ -1466,7 +1481,16 @@ class Win(Adw.ApplicationWindow):
     # ---- queue
     def mark(self, action):
         valid = lambda p: action_valid(p, action)
-        group = CHANGE_ACTIONS if action in CHANGE_ACTIONS else {"pin", "unpin", "block"}
+        group = CHANGE_ACTIONS if action in CHANGE_ACTIONS else PIN_ACTIONS
+        if action == "pinver":
+            sel = self.selected()
+            if len(sel) != 1:
+                self.toast("Select a single package to pin to a version")
+                return
+            if "pinver" not in sel[0].actions:  # a second click removes it from the queue
+                if action_valid(sel[0], action):
+                    self.pick_version(sel[0])
+                return
         for p in self.selected():
             if action in p.actions:
                 p.actions.discard(action)
@@ -1478,6 +1502,51 @@ class Win(Adw.ApplicationWindow):
             else:
                 self.queue.discard(p)
             p.refresh()
+        self.refresh_visible()
+        self.update_apply()
+        if self.mode.get_selected() == M_QUEUED:
+            self.refilter()
+
+    def pick_version(self, p):
+        self.spin.start()
+
+        def work():
+            try:
+                vs = pkg_versions(p.name, p.arch)
+            except Exception:
+                vs = []
+            GLib.idle_add(self._versions_ready, p, vs)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _versions_ready(self, p, vs):
+        if not (self.loading_main or self.checking or self.set_loading):
+            self.spin.stop()
+        if not vs:
+            self.toast(f"No versions found for {p.name}")
+            return False
+        dd = Gtk.DropDown.new_from_strings(
+            [v + (" (installed)" if v == p.inst else "") for v in vs])
+        if p.inst in vs:
+            dd.set_selected(vs.index(p.inst))
+        dlg = Adw.AlertDialog(heading=f"Pin {p.name} to a version",
+                              body="Only this version will stay available for transactions.")
+        dlg.set_extra_child(dd)
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("queue", "Queue pin")
+        dlg.set_response_appearance("queue", Adw.ResponseAppearance.SUGGESTED)
+        dlg.set_default_response("queue")
+        dlg.set_close_response("cancel")
+        dlg.connect("response", lambda _d, r: r == "queue" and self._queue_pin(p, vs[dd.get_selected()]))
+        dlg.present(self)
+        return False
+
+    def _queue_pin(self, p, evr):
+        p.pin_to = evr
+        p.actions -= PIN_ACTIONS
+        p.actions.add("pinver")
+        self.queue.add(p)
+        p.refresh()
         self.refresh_visible()
         self.update_apply()
         if self.mode.get_selected() == M_QUEUED:
@@ -1518,6 +1587,8 @@ class Win(Adw.ApplicationWindow):
             cmds.append(["dnf5", "-y", "downgrade", *[p.spec for p in by("downgrade")]])
         if by("pin"):
             cmds.append(["dnf5", "versionlock", "add", *[p.name for p in by("pin")]])
+        if by("pinver"):
+            cmds.append(["dnf5", "versionlock", "add", *[f"{p.name}-{p.pin_to}" for p in by("pinver")]])
         if by("block"):
             cmds.append(["dnf5", "versionlock", "exclude", *[p.name for p in by("block")]])
         return cmds
