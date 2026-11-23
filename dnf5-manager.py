@@ -479,8 +479,10 @@ class HistoryWindow(Adw.Window):
         return False
 
     def details(self, tid):
-        RunWindow(self, f"Transaction {tid}", ["dnf5", "history", "info", str(tid)],
-                  f"dnf5 history info {tid}", autorun=True).present()
+        w = RunWindow(self, f"Transaction {tid}", ["dnf5", "history", "info", str(tid)],
+                      f"dnf5 history info {tid}", autorun=True)
+        w.run_btn.set_visible(False)
+        w.present()
 
     def _transact(self, verb, tid):
         self.close()
@@ -533,11 +535,22 @@ class PinsWindow(Adw.Window):
 
     def remove(self, name):
         self.close()
-        self.parent_win.run_root("Remove pin", [["dnf5", "versionlock", "delete", name]])
+        self.parent_win.run_root(f"Unpinned {name}", [["dnf5", "versionlock", "delete", name]])
 
     def remove_all(self):
+        dlg = Adw.AlertDialog(heading="Remove all pins?",
+                              body="Every version lock and block will be deleted.")
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("remove", "Remove all")
+        dlg.set_response_appearance("remove", Adw.ResponseAppearance.DESTRUCTIVE)
+        dlg.set_default_response("cancel")
+        dlg.set_close_response("cancel")
+        dlg.connect("response", lambda _d, r: r == "remove" and self._clear_pins())
+        dlg.present(self)
+
+    def _clear_pins(self):
         self.close()
-        self.parent_win.run_root("Remove all pins", [["dnf5", "versionlock", "clear"]])
+        self.parent_win.run_root("Removed all pins", [["dnf5", "versionlock", "clear"]])
 
 
 class CompsPage(Gtk.Box):
@@ -787,7 +800,7 @@ class RepoWindow(Adw.Window):
                 for rid, on in self.changes().items()]
         if cmds:
             self.close()
-            self.parent_win.run_root("Change repositories", cmds)
+            self.parent_win.run_root("Repositories updated", cmds)
 
     def pick_folder(self):
         dlg = Gtk.FileDialog(title="Select a folder containing RPMs and repodata/")
@@ -999,10 +1012,9 @@ class Win(Adw.ApplicationWindow):
         add("metadata", lambda: self.check_updates(show=False))
         add("upgrade_all", self.upgrade_all)
         add("upgrade_security", self.upgrade_security)
-        add("autoremove", lambda: self.run_cmd(
-            "Autoremove", ["pkexec", "dnf5", "-y", "autoremove"], "dnf5 -y autoremove", reload=True))
-        add("clean", lambda: self.run_cmd(
-            "Clean caches", ["pkexec", "dnf5", "clean", "all"], "dnf5 clean all"))
+        add("autoremove", self.autoremove)
+        add("clean", lambda: self.quiet("Caches cleaned", ["pkexec", "dnf5", "clean", "all"],
+                                        reload=False))
         add("mark_user", lambda: self.mark_selected("install", "user-installed"))
         add("mark_auto", lambda: self.mark_selected("remove", "dependency"))
         add("history", lambda: HistoryWindow(self).present())
@@ -1049,13 +1061,47 @@ class Win(Adw.ApplicationWindow):
                   on_done=(lambda rc: self.reload()) if reload else None,
                   autorun=autorun, dry=dry, rebuild=rebuild).present()
 
-    def run_root(self, title, cmds, note=""):
-        script = " && ".join(shlex.join(c) for c in cmds)
-        preview = "Commands (run as root):\n\n" + "\n".join("  " + shlex.join(c) for c in cmds)
-        if note:
-            preview += "\n\n" + note
-        self.run_cmd(title, ["pkexec", "sh", "-c", script],
-                     preview + "\n\nPress Run to execute.", reload=True)
+    def run_root(self, done, cmds):
+        """Short privileged commands, run in the background; `done` is the success toast."""
+        self.quiet(done, ["pkexec", "sh", "-c", " && ".join(shlex.join(c) for c in cmds)])
+
+    def quiet(self, done, argv, reload=True):
+        """Run a short command without a window: toast on success, Details on failure."""
+        self.spin.start()
+
+        def work():
+            try:
+                r = subprocess.run(argv, capture_output=True, text=True)
+                rc, out = r.returncode, r.stdout + r.stderr
+            except Exception as e:
+                rc, out = -1, str(e)
+            GLib.idle_add(self._quiet_done, done, rc, out, reload)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _quiet_done(self, done, rc, out, reload):
+        if not (self.loading_main or self.checking or self.security_loading):
+            self.spin.stop()
+        if rc != 0:
+            self.toast_details("Action failed", "Output", out)
+        else:
+            self.toast(done)
+            if reload:
+                self.reload()
+        return False
+
+    def toast_details(self, msg, title, out):
+        t = Adw.Toast.new(msg)
+        t.set_button_label("Details")
+        t.connect("button-clicked", lambda *_: self.show_output(title, out))
+        self.overlay.add_toast(t)
+
+    def autoremove(self):
+        cmd = ["dnf5", "-y", "autoremove"]
+        dry = [c for c in cmd if c != "-y"] + ["--assumeno"]
+        self.run_cmd("Remove unneeded packages", ["pkexec", *cmd],
+                     shlex.join(cmd) + "\n\nThe dry run below shows what will be removed.",
+                     reload=True, dry=[dry])
 
     def selected(self):
         bs = self.selection.get_selection()
@@ -1125,10 +1171,7 @@ class Win(Adw.ApplicationWindow):
         self.check_btn.set_sensitive(True)
         if rc != 0:
             self.spin.stop()
-            t = Adw.Toast.new("Could not check for updates")
-            t.set_button_label("Details")
-            t.connect("button-clicked", lambda *_: self.show_output("Check for updates", out))
-            self.overlay.add_toast(t)
+            self.toast_details("Could not check for updates", "Check for updates", out)
             return False
         self.after_load = self._show_updates if show else self._refreshed
         self.reload()
@@ -1419,8 +1462,8 @@ class Win(Adw.ApplicationWindow):
         if not names:
             self.toast("Select installed packages first")
             return
-        cmd = ["dnf5", "mark", kind, *names]
-        self.run_cmd(f"Mark as {label}", ["pkexec", *cmd], shlex.join(cmd))
+        self.quiet(f"Marked {len(names)} package(s) as {label}",
+                   ["pkexec", "dnf5", "mark", kind, *names], reload=False)
 
 
 BIN_PATH = os.path.expanduser("~/.local/bin/dnf5-manager")
