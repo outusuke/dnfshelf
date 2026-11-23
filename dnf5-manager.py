@@ -47,8 +47,9 @@ PKG_QF = r"%{name}\n"
 SO_CAP = re.compile(r"^([^()\s]+\.so[^()\s]*)\(.*\)$")
 COMPS_RE = re.compile(r"^(\S+)\s+(.+?)\s+(yes|no)\s*$")
 WIDE_ENV = {**os.environ, "COLUMNS": "1000"}  # keep dnf5 tables from truncating names
-MODES = ["All", "Installed", "Not installed", "Upgradable", "Pinned", "Queued changes",
+MODES = ["All", "Installed", "Not installed", "Upgradable", "Queued changes",
          "Security updates"]
+M_UPGRADABLE, M_QUEUED, M_SECURITY = 3, 4, 5
 
 
 # ---------------------------------------------------------------- data layer
@@ -1120,7 +1121,7 @@ class Win(Adw.ApplicationWindow):
         self.reload()
 
     def _show_updates(self):
-        self.mode.set_selected(3)  # Upgradable
+        self.mode.set_selected(M_UPGRADABLE)
         self.refilter()
         self.toast(f"{self.n_upg} updates available" if self.n_upg else "System is up to date")
 
@@ -1178,13 +1179,11 @@ class Win(Adw.ApplicationWindow):
             rows = [p for p in rows if p.installed]
         elif mode == 2:
             rows = [p for p in rows if not p.installed]
-        elif mode == 3:
+        elif mode == M_UPGRADABLE:
             rows = [p for p in rows if p.upgradable]
-        elif mode == 4:
-            rows = [p for p in rows if p.pinned]
-        elif mode == 5:
+        elif mode == M_QUEUED:
             rows = [p for p in rows if p in self.queue]
-        elif mode == 6:
+        elif mode == M_SECURITY:
             if self.security is None:
                 self.fetch_security()
                 rows = []
@@ -1196,7 +1195,7 @@ class Win(Adw.ApplicationWindow):
         elif rows is self.all:
             rows = list(rows)
         self.model.set_rows(rows)
-        loading = mode == 6 and self.security is None
+        loading = mode == M_SECURITY and self.security is None
         text = f"{len(rows)} packages" + (f" \u00b7 {self.n_upg} upgradable" if self.n_upg else "")
         self.count.set_text("Checking security advisories\u2026" if loading else text)
 
@@ -1224,7 +1223,7 @@ class Win(Adw.ApplicationWindow):
             self.security = keys
             if not keys:
                 self.toast("No security updates found (or advisory metadata unavailable)")
-        if self.mode.get_selected() == 6:
+        if self.mode.get_selected() == M_SECURITY:
             self.refilter()  # also re-fetches if a reload made this result stale
         return False
 
@@ -1332,7 +1331,7 @@ class Win(Adw.ApplicationWindow):
             p.refresh()
         self.refresh_visible()
         self.update_apply()
-        if self.mode.get_selected() == 5:
+        if self.mode.get_selected() == M_QUEUED:
             self.refilter()
 
     def clear_queue(self):
@@ -1342,7 +1341,7 @@ class Win(Adw.ApplicationWindow):
         self.queue = set()
         self.refresh_visible()
         self.update_apply()
-        if self.mode.get_selected() == 5:
+        if self.mode.get_selected() == M_QUEUED:
             self.refilter()
 
     def update_apply(self):
