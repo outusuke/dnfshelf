@@ -13,6 +13,7 @@ get one polkit prompt per transaction. Pins use `dnf5 versionlock`
 (state in /etc/dnf/versionlock.toml).
 """
 import os
+import re
 import shlex
 import subprocess
 import threading
@@ -67,6 +68,16 @@ def collect_packages():
             pk[(n, a)]["upg"] = True
     pins = load_pins()
     return [Pkg(d, d["name"] in pins) for d in pk.values()]
+
+
+def parse_repos(text):
+    """Parse `dnf5 repo list --all` into [(id, name, enabled)]."""
+    repos = []
+    for line in text.splitlines():
+        t = line.split()
+        if len(t) >= 2 and t[-1] in ("enabled", "disabled") and t[:2] != ["repo", "id"]:
+            repos.append((t[0], " ".join(t[1:-1]), t[-1] == "enabled"))
+    return repos
 
 
 class Pkg(GObject.Object):
@@ -192,6 +203,90 @@ class RunWindow(Adw.Window):
 
 
 # ---------------------------------------------------------------- main window
+class RepoWindow(Adw.Window):
+    """Enable/disable repositories and add local (file://) repositories."""
+
+    def __init__(self, parent):
+        super().__init__(transient_for=parent, modal=True, title="Repositories",
+                         default_width=720, default_height=560)
+        self.parent_win = parent
+        self.rows = {}  # repo id -> (SwitchRow, original enabled state)
+        hb = Adw.HeaderBar()
+        add_btn = Gtk.Button(label="Add local repo\u2026")
+        add_btn.connect("clicked", lambda *_: self.pick_folder())
+        hb.pack_start(add_btn)
+        self.save_btn = Gtk.Button(label="Apply", sensitive=False,
+                                   css_classes=["suggested-action"])
+        self.save_btn.connect("clicked", lambda *_: self.apply())
+        hb.pack_end(self.save_btn)
+        self.box = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE,
+                               css_classes=["boxed-list"], margin_top=12, margin_bottom=12,
+                               margin_start=12, margin_end=12, valign=Gtk.Align.START)
+        tb = Adw.ToolbarView()
+        tb.add_top_bar(hb)
+        tb.set_content(Gtk.ScrolledWindow(vexpand=True, child=self.box))
+        self.overlay = Adw.ToastOverlay(child=tb)
+        self.set_content(self.overlay)
+        threading.Thread(target=self._load, daemon=True).start()
+
+    def _load(self):
+        GLib.idle_add(self._populate, parse_repos(run(["dnf5", "repo", "list", "--all"])))
+
+    def _populate(self, repos):
+        while (row := self.box.get_first_child()):
+            self.box.remove(row)
+        self.rows = {}
+        for rid, name, enabled in repos:
+            row = Adw.SwitchRow(title=rid, subtitle=name, active=enabled)
+            row.connect("notify::active", lambda *_: self.on_toggle())
+            self.box.append(row)
+            self.rows[rid] = (row, enabled)
+        return False
+
+    def changes(self):
+        return {rid: row.get_active() for rid, (row, orig) in self.rows.items()
+                if row.get_active() != orig}
+
+    def on_toggle(self):
+        self.save_btn.set_sensitive(bool(self.changes()))
+
+    def apply(self):
+        cmds = [["dnf5", "config-manager", "setopt", f"{rid}.enabled={int(on)}"]
+                for rid, on in self.changes().items()]
+        if cmds:
+            self.close()
+            self.parent_win.run_root("Change repositories", cmds)
+
+    def pick_folder(self):
+        dlg = Gtk.FileDialog(title="Select a folder containing RPMs and repodata/")
+        dlg.select_folder(self, None, self._folder_chosen)
+
+    def _folder_chosen(self, dlg, res):
+        try:
+            folder = dlg.select_folder_finish(res)
+        except GLib.Error:
+            return
+        path = folder.get_path()
+        if not path:
+            return
+        if not os.path.exists(os.path.join(path, "repodata", "repomd.xml")):
+            self.overlay.add_toast(Adw.Toast.new(
+                "No repodata/ found in that folder. Run createrepo_c on it first."))
+            return
+        rid = "local-" + re.sub(r"[^A-Za-z0-9_.-]", "-", os.path.basename(path.rstrip("/")) or "repo")
+        lines = [f"[{rid}]", f"name=Local repo {rid}", f"baseurl={folder.get_uri()}",
+                 "enabled=1", "gpgcheck=0", "skip_if_unavailable=1"]
+        script = "printf '%s\\n' " + " ".join(shlex.quote(x) for x in lines) + \
+                 f" > /etc/yum.repos.d/{rid}.repo"
+        preview = f"Create /etc/yum.repos.d/{rid}.repo (as root):\n\n" + \
+                  "\n".join("  " + x for x in lines) + \
+                  "\n\nNote: gpgcheck is disabled because local repos are usually unsigned.\n" \
+                  "Press Run to execute."
+        self.close()
+        self.parent_win.run_cmd("Add local repo", ["pkexec", "sh", "-c", script],
+                                preview, reload=True)
+
+
 class Win(Adw.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title="DNF5 Package Manager",
@@ -331,8 +426,7 @@ class Win(Adw.ApplicationWindow):
         add("mark_auto", lambda: self.mark_selected("remove", "dependency"))
         add("history", lambda: self.run_cmd(
             "History", ["dnf5", "history", "list"], "dnf5 history list", autorun=True))
-        add("repos", lambda: self.run_cmd(
-            "Repositories", ["dnf5", "repo", "list", "--all"], "dnf5 repo list --all", autorun=True))
+        add("repos", lambda: RepoWindow(self).present())
         add("pins", lambda: self.run_cmd(
             "Pins", ["dnf5", "versionlock", "list"], "dnf5 versionlock list", autorun=True))
 
@@ -343,6 +437,14 @@ class Win(Adw.ApplicationWindow):
         RunWindow(self, title, argv, preview,
                   on_done=(lambda rc: self.reload()) if reload else None,
                   autorun=autorun, dry=dry).present()
+
+    def run_root(self, title, cmds, note=""):
+        script = " && ".join(shlex.join(c) for c in cmds)
+        preview = "Commands (run as root):\n\n" + "\n".join("  " + shlex.join(c) for c in cmds)
+        if note:
+            preview += "\n\n" + note
+        self.run_cmd(title, ["pkexec", "sh", "-c", script],
+                     preview + "\n\nPress Run to execute.", reload=True)
 
     def selected(self):
         bs = self.selection.get_selection()
