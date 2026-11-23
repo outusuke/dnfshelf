@@ -307,10 +307,13 @@ class PkgModel(GObject.Object, Gio.ListModel):
 class RunWindow(Adw.Window):
     """Shows what will run, then streams output. Run button executes it."""
 
-    def __init__(self, parent, title, argv, preview, on_done=None, autorun=False, dry=None):
+    def __init__(self, parent, title, argv, preview, on_done=None, autorun=False, dry=None,
+                 rebuild=None):
         super().__init__(transient_for=parent, modal=True, title=title,
                          default_width=800, default_height=500)
         self.argv, self.on_done = argv, on_done
+        self.rebuild = rebuild   # rebuild(erase) -> (argv, preview, dry), used to retry
+        self.erasing = False
         self.tv = Gtk.TextView(editable=False, monospace=True, left_margin=8,
                                top_margin=8, bottom_margin=8, wrap_mode=Gtk.WrapMode.WORD_CHAR)
         self.buf = self.tv.get_buffer()
@@ -320,8 +323,14 @@ class RunWindow(Adw.Window):
         self.close_btn.connect("clicked", lambda *_: self.close())
         self.run_btn = Gtk.Button(label="Run", css_classes=["suggested-action"])
         self.run_btn.connect("clicked", lambda *_: self.start())
+        self.retry_btn = Gtk.Button(
+            label="Retry allowing package removal", visible=False,
+            tooltip_text="Run the dry run again with --allowerasing. "
+                         "Nothing is removed until you press Run.")
+        self.retry_btn.connect("clicked", lambda *_: self.retry())
         hb.pack_start(self.close_btn)
         hb.pack_end(self.run_btn)
+        hb.pack_end(self.retry_btn)
         tb = Adw.ToolbarView()
         tb.add_top_bar(hb)
         tb.set_content(Gtk.ScrolledWindow(vexpand=True, child=self.tv))
@@ -350,12 +359,35 @@ class RunWindow(Adw.Window):
         GLib.idle_add(self._dry_done, "\n".join(out).replace("\r", "\n"))
 
     def _dry_done(self, text):
+        failed = "Failed to resolve the transaction" in text
         warn = ""
-        if "Removing dependent packages" in text or "Removing unused dependencies" in text:
+        if self.erasing and not failed:
+            warn = ("WARNING: package removal is allowed. Packages you did not select may be "
+                    "removed. Review the 'Removing' entries below.\n\n")
+        elif "Removing dependent packages" in text or "Removing unused dependencies" in text:
             warn = "WARNING: this transaction also removes other packages. Review carefully.\n\n"
+        if failed:
+            can_retry = self.rebuild is not None and not self.erasing
+            tail = "\n--- dry run failed; nothing was changed ---\n"
+            if can_retry:
+                tail += 'Use "Retry allowing package removal" to see what that would do.\n'
+            elif self.erasing:
+                tail += "Allowing package removal was not enough to resolve this.\n"
+            self.append("\n" + text + tail)
+            self.retry_btn.set_visible(can_retry)
+            return False  # Run stays disabled: it would fail the same way
         self.append("\n" + warn + text + "\n--- dry run finished; press Run to apply ---\n")
         self.run_btn.set_sensitive(True)
         return False
+
+    def retry(self):
+        self.erasing = True
+        self.retry_btn.set_visible(False)
+        self.run_btn.set_sensitive(False)
+        self.argv, preview, dry = self.rebuild(True)
+        self.append("\n--- retrying with --allowerasing ---\n" + preview +
+                    "\nCalculating transaction (dry run)...\n")
+        threading.Thread(target=self._dry_worker, args=(dry,), daemon=True).start()
 
     def start(self):
         self.run_btn.set_sensitive(False)
@@ -628,11 +660,6 @@ class Win(Adw.ApplicationWindow):
                                     css_classes=["suggested-action"])
         self.apply_btn.connect("clicked", lambda *_: self.apply())
         hb.pack_end(self.apply_btn)
-        self.allow_erasing = Gtk.CheckButton(
-            label="Allow erasing",
-            tooltip_text="Let install/upgrade remove installed packages to resolve conflicts "
-                         "(dnf5 --allowerasing). Check the dry run before pressing Run.")
-        hb.pack_end(self.allow_erasing)
 
         # package table
         self.view = Gtk.ColumnView(show_row_separators=True)
@@ -786,23 +813,24 @@ class Win(Adw.ApplicationWindow):
         mark.connect("activate", lambda _a, param: self.mark(param.get_string()))
         self.add_action(mark)
 
-    def erase_flag(self):
-        return ["--allowerasing"] if self.allow_erasing.get_active() else []
+    def upgrade_flow(self, title, extra=(), note=""):
+        """Upgrade with a dry run first; offers --allowerasing only if that dry run fails."""
+        def build(erase):
+            cmd = ["dnf5", "-y", "upgrade", *extra, *(["--allowerasing"] if erase else [])]
+            dry = [c for c in cmd if c != "-y"] + ["--assumeno"]
+            preview = shlex.join(cmd) + note + "\n\nThe dry run below shows what will change."
+            return ["pkexec", *cmd], preview, [dry]
 
-    def upgrade_cmd(self, *extra):
-        return ["dnf5", "-y", "upgrade", *extra, *self.erase_flag()]
+        argv, preview, dry = build(False)
+        self.run_cmd(title, argv, preview, reload=True, dry=dry, rebuild=build)
 
     def upgrade_all(self):
-        cmd = self.upgrade_cmd()
-        self.run_cmd("Upgrade all", ["pkexec", *cmd], shlex.join(cmd), reload=True)
+        self.upgrade_flow("Upgrade all")
 
     def upgrade_security(self):
-        cmd = self.upgrade_cmd("--security")
-        dry = [c for c in cmd if c != "-y"] + ["--assumeno"]
-        self.run_cmd("Upgrade security updates", ["pkexec", *cmd],
-                     shlex.join(cmd) + "\n\nUpgrades only to the lowest versions that fix "
-                     "security advisories, not necessarily the newest.\nThe dry run below "
-                     "shows what will change.", reload=True, dry=[dry])
+        self.upgrade_flow("Upgrade security updates", ("--security",),
+                          "\n\nUpgrades only to the lowest versions that fix security "
+                          "advisories, not necessarily the newest.")
 
     def toast(self, msg):
         self.overlay.add_toast(Adw.Toast.new(msg))
@@ -813,10 +841,11 @@ class Win(Adw.ApplicationWindow):
         except Exception as e:
             self.toast(f"Failed: {e}")
 
-    def run_cmd(self, title, argv, preview, reload=False, autorun=False, dry=None):
+    def run_cmd(self, title, argv, preview, reload=False, autorun=False, dry=None,
+                rebuild=None):
         RunWindow(self, title, argv, preview,
                   on_done=(lambda rc: self.reload()) if reload else None,
-                  autorun=autorun, dry=dry).present()
+                  autorun=autorun, dry=dry, rebuild=rebuild).present()
 
     def run_root(self, title, cmds, note=""):
         script = " && ".join(shlex.join(c) for c in cmds)
@@ -1094,19 +1123,18 @@ class Win(Adw.ApplicationWindow):
         self.clear_btn.set_visible(n > 0)
         self.update_actions()
 
-    def apply(self):
+    def plan(self, erase=False):
         by = lambda a: [p for p in self.queue if a in p.actions]
+        flag = ["--allowerasing"] if erase else []
         cmds = []
         if by("unpin"):
             cmds.append(["dnf5", "versionlock", "delete", *[p.name for p in by("unpin")]])
         if by("remove"):
             cmds.append(["dnf5", "-y", "remove", *[p.spec for p in by("remove")]])
         if by("install"):
-            cmds.append(["dnf5", "-y", "install", *self.erase_flag(),
-                         *[p.spec for p in by("install")]])
+            cmds.append(["dnf5", "-y", "install", *flag, *[p.spec for p in by("install")]])
         if by("upgrade"):
-            cmds.append(["dnf5", "-y", "upgrade", *self.erase_flag(),
-                         *[p.spec for p in by("upgrade")]])
+            cmds.append(["dnf5", "-y", "upgrade", *flag, *[p.spec for p in by("upgrade")]])
         if by("reinstall"):
             cmds.append(["dnf5", "-y", "reinstall", *[p.spec for p in by("reinstall")]])
         if by("downgrade"):
@@ -1115,15 +1143,26 @@ class Win(Adw.ApplicationWindow):
             cmds.append(["dnf5", "versionlock", "add", *[p.name for p in by("pin")]])
         if by("block"):
             cmds.append(["dnf5", "versionlock", "exclude", *[p.name for p in by("block")]])
+        return cmds
+
+    def apply(self):
+        def build(erase):
+            cmds = self.plan(erase)
+            script = " && ".join(shlex.join(c) for c in cmds)
+            preview = "Planned commands (run in order, as root):\n\n" + \
+                      "\n".join("  " + shlex.join(c) for c in cmds) + \
+                      "\n\nPress Run to execute."
+            dry = [[c for c in cmd if c != "-y"] + ["--assumeno"] for cmd in cmds if "-y" in cmd]
+            return ["pkexec", "sh", "-c", script], preview, dry
+
+        cmds = self.plan()
         if not cmds:
             return
-        script = " && ".join(shlex.join(c) for c in cmds)
-        preview = "Planned commands (run in order, as root):\n\n" + \
-                  "\n".join("  " + shlex.join(c) for c in cmds) + \
-                  "\n\nPress Run to execute."
-        dry = [[c for c in cmd if c != "-y"] + ["--assumeno"] for cmd in cmds if "-y" in cmd]
-        self.run_cmd("Apply changes", ["pkexec", "sh", "-c", script], preview,
-                     reload=True, dry=dry or None)
+        argv, preview, dry = build(False)
+        # --allowerasing only exists on install/upgrade here, so only offer a retry for those
+        can_erase = any(c[2] in ("install", "upgrade") for c in cmds)
+        self.run_cmd("Apply changes", argv, preview, reload=True, dry=dry or None,
+                     rebuild=build if can_erase else None)
 
     def mark_selected(self, kind, label):
         names = [p.spec for p in self.selected() if p.installed]
