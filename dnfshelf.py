@@ -35,7 +35,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango  # noqa: E402
 
-APP_ID = "org.example.Dnfshelf"
+APP_ID = "org.outusuke.Dnfshelf"
 VERSIONLOCK_FILE = "/etc/dnf/versionlock.toml"
 QF = r"%{name}|%{evr}|%{arch}|%{repoid}|%{summary}\n"
 # List packages from the local metadata cache (no network round trip on every start).
