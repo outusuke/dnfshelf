@@ -16,6 +16,8 @@ Everything goes through the dnf5 CLI. Privileged operations use pkexec, so you
 get one polkit prompt per transaction. Pins use `dnf5 versionlock`
 (state in /etc/dnf/versionlock.toml).
 """
+import json
+import operator
 import os
 import re
 import shlex
@@ -24,6 +26,7 @@ import subprocess
 import sys
 import threading
 import tomllib
+from concurrent.futures import ThreadPoolExecutor
 
 import gi
 
@@ -34,6 +37,12 @@ from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango  # noqa: E402
 APP_ID = "org.example.Dnf5Manager"
 VERSIONLOCK_FILE = "/etc/dnf/versionlock.toml"
 QF = r"%{name}|%{evr}|%{arch}|%{repoid}|%{summary}\n"
+# List packages from the local metadata cache (no network round trip on every start).
+# Falls back to a normal dnf5 run automatically if that fails. Use "Refresh repo
+# metadata" in the menu to update the cache.
+USE_CACHEONLY = True
+CACHE_DIR = os.path.join(GLib.get_user_cache_dir(), "dnf5-manager")
+CACHE_FILE = os.path.join(CACHE_DIR, "packages.json")
 MODES = ["All", "Installed", "Not installed", "Upgradable", "Pinned", "Queued changes"]
 
 
@@ -42,8 +51,17 @@ def run(argv):
     return subprocess.run(argv, capture_output=True, text=True).stdout
 
 
+def dnf5(*args):
+    """Read-only dnf5 call, preferring the local metadata cache."""
+    if USE_CACHEONLY:
+        r = subprocess.run(["dnf5", "--cacheonly", *args], capture_output=True, text=True)
+        if r.returncode == 0:
+            return r.stdout
+    return run(["dnf5", *args])
+
+
 def query(*flags):
-    out = run(["dnf5", "repoquery", *flags, "--queryformat", QF])
+    out = dnf5("repoquery", *flags, "--queryformat", QF)
     rows = []
     for line in out.splitlines():
         parts = line.split("|", 4)
@@ -79,19 +97,50 @@ def load_pin_entries():
     return sorted(out)
 
 
-def collect_packages():
+def collect_raw():
+    """[[name, arch, avail, inst, repo, summary, upgradable(0/1)]] sorted by name."""
+    with ThreadPoolExecutor(max_workers=3) as ex:  # the three queries are independent
+        f_avail = ex.submit(query, "--available", "--latest-limit=1")
+        f_inst = ex.submit(query, "--installed")
+        f_upg = ex.submit(query, "--upgrades", "--latest-limit=1")
+        avail, inst, upg = f_avail.result(), f_inst.result(), f_upg.result()
     pk = {}
-    for n, e, a, r, s in query("--available", "--latest-limit=1"):
-        pk[(n, a)] = dict(name=n, arch=a, avail=e, inst="", repo=r, summary=s, upg=False)
-    for n, e, a, r, s in query("--installed"):
-        d = pk.setdefault((n, a), dict(name=n, arch=a, avail="", repo="(local)", summary=s, upg=False))
-        d["inst"] = e
-    for n, e, a, r, s in query("--upgrades", "--latest-limit=1"):
-        if (n, a) in pk:
-            pk[(n, a)]["avail"] = e
-            pk[(n, a)]["upg"] = True
+    for n, e, a, r, s in avail:
+        pk[(n, a)] = [n, a, e, "", r, s, 0]
+    for n, e, a, r, s in inst:
+        pk.setdefault((n, a), [n, a, "", "", "(local)", s, 0])[3] = e
+    for n, e, a, r, s in upg:
+        d = pk.get((n, a))
+        if d:
+            d[2], d[6] = e, 1
+    if not pk:
+        raise RuntimeError("dnf5 returned no packages")
+    return sorted(pk.values(), key=lambda d: (d[0], d[1]))
+
+
+def build_pkgs(raw):
     pins = load_pins()
-    return [Pkg(d, d["name"] in pins) for d in pk.values()]
+    return [Pkg(d, d[0] in pins) for d in raw]
+
+
+def read_cache():
+    try:
+        with open(CACHE_FILE) as f:
+            data = json.load(f)
+        return data if isinstance(data, list) and data else None
+    except Exception:
+        return None
+
+
+def write_cache(raw):
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        tmp = CACHE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(raw, f, separators=(",", ":"))
+        os.replace(tmp, CACHE_FILE)
+    except OSError:
+        pass
 
 
 def parse_repos(text):
@@ -140,29 +189,20 @@ def action_valid(p, action):
 
 
 class Pkg(GObject.Object):
+    """Plain Python attributes on purpose: GObject properties cost a C<->Python round
+    trip per access, which is painful with tens of thousands of packages."""
     __gtype_name__ = "Dnf5Pkg"
-    name = GObject.Property(type=str, default="")
-    version = GObject.Property(type=str, default="")
-    latest = GObject.Property(type=str, default="")
-    repo = GObject.Property(type=str, default="")
-    summary = GObject.Property(type=str, default="")
-    status = GObject.Property(type=str, default="")
-    queued = GObject.Property(type=str, default="")
 
     def __init__(self, d, pinned):
         super().__init__()
-        self.arch = d["arch"]
-        self.inst = d.get("inst", "")
+        self.name, self.arch, self.latest, self.inst, self.repo, self.summary, upg = d
         self.installed = bool(self.inst)
-        self.upgradable = d["upg"]
+        self.upgradable = bool(upg)
         self.pinned = pinned
         self.actions = set()
-        self.name = d["name"]
-        self.version = self.inst or d["avail"]
-        self.latest = d["avail"]
-        self.repo = d["repo"]
-        self.summary = d["summary"]
+        self.version = self.inst or self.latest
         self.hay = f"{self.name} {self.summary}".lower()
+        self.status = self.queued = ""
         self.refresh()
 
     @property
@@ -177,6 +217,29 @@ class Pkg(GObject.Object):
             s.append("pinned")
         self.status = ", ".join(s)
         self.queued = ", ".join(sorted(self.actions))
+
+
+class PkgModel(GObject.Object, Gio.ListModel):
+    """Minimal Python list model. Filtering and sorting happen in plain Python lists
+    (milliseconds) instead of Gtk filter/sort models calling back into Python per row."""
+
+    def __init__(self):
+        super().__init__()
+        self.rows = []
+
+    def do_get_item_type(self):
+        return Pkg.__gtype__
+
+    def do_get_n_items(self):
+        return len(self.rows)
+
+    def do_get_item(self, position):
+        return self.rows[position] if 0 <= position < len(self.rows) else None
+
+    def set_rows(self, rows):
+        removed = len(self.rows)
+        self.rows = rows
+        self.items_changed(0, removed, len(rows))
 
 
 # ---------------------------------------------------------------- run window
@@ -471,10 +534,16 @@ class Win(Adw.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title="DNF5 Package Manager",
                          default_width=1250, default_height=780)
-        self.store = Gio.ListStore.new(Pkg)
+        self.model = PkgModel()
+        self.all = []          # every package, kept sorted
         self.queue = set()
         self.query = ""
         self.info_token = 0
+        self.info_timer = 0
+        self.gen = 0           # load generation, so stale loads are ignored
+        self.live = set()      # currently bound Status/Queued cells
+        self.sort_prop, self.sort_desc = "name", False
+        self.col_props = {}
 
         # header bar
         hb = Adw.HeaderBar()
@@ -504,14 +573,11 @@ class Win(Adw.ApplicationWindow):
         self.add_col("Repo", "repo", width=130)
         self.add_col("Summary", "summary", expand=True)
 
-        self.filter = Gtk.CustomFilter.new(self.match)
-        self.filtered = Gtk.FilterListModel(model=self.store, filter=self.filter)
-        self.filtered.connect("items-changed", self.on_count)
-        sorted_model = Gtk.SortListModel(model=self.filtered, sorter=self.view.get_sorter())
-        self.selection = Gtk.MultiSelection(model=sorted_model)
+        self.selection = Gtk.MultiSelection(model=self.model)
         self.selection.connect("selection-changed", self.on_select)
         self.view.set_model(self.selection)
-        self.view.sort_by_column(name_col, Gtk.SortType.ASCENDING)
+        # Header clicks only update the view's sorter; we sort our own list when it changes.
+        self.view.get_sorter().connect("changed", self.on_sort_changed)
 
         # bottom: actions + info
         bar = Gtk.Box(spacing=6, margin_top=6, margin_bottom=6, margin_start=6, margin_end=6)
@@ -547,13 +613,16 @@ class Win(Adw.ApplicationWindow):
         self.overlay = Adw.ToastOverlay(child=tb)
         self.set_content(self.overlay)
         self.install_actions()
+        self.view.sort_by_column(name_col, Gtk.SortType.ASCENDING)  # last: needs self.count
 
     # ---- UI helpers
     def add_col(self, title, prop, width=None, expand=False):
         f = Gtk.SignalListItemFactory()
+        live = prop in ("status", "queued")  # the only cells that change after load
 
         def setup(_f, li):
             lbl = Gtk.Label(xalign=0, hexpand=True, ellipsize=Pango.EllipsizeMode.END,
+                            single_line_mode=True, max_width_chars=1,
                             margin_start=6, margin_end=6)
             click = Gtk.GestureClick(button=3)
             click.connect("pressed", lambda g, n, x, y, li=li, w=lbl: self.context_menu(li, w, x, y))
@@ -561,11 +630,17 @@ class Win(Adw.ApplicationWindow):
             li.set_child(lbl)
 
         def bind(_f, li):
-            li.binding = li.get_item().bind_property(
-                prop, li.get_child(), "label", GObject.BindingFlags.SYNC_CREATE)
+            text = getattr(li.get_item(), prop)
+            lbl = li.get_child()
+            if lbl.get_label() != text:
+                lbl.set_label(text)
+            if live:
+                li.prop = prop
+                self.live.add(li)
 
         def unbind(_f, li):
-            li.binding.unbind()
+            if live:
+                self.live.discard(li)
 
         f.connect("setup", setup)
         f.connect("bind", bind)
@@ -573,9 +648,16 @@ class Win(Adw.ApplicationWindow):
         col = Gtk.ColumnViewColumn(title=title, factory=f, resizable=True, expand=expand)
         if width:
             col.set_fixed_width(width)
-        col.set_sorter(Gtk.StringSorter(expression=Gtk.PropertyExpression.new(Pkg, None, prop)))
+        col.set_sorter(Gtk.CustomSorter.new(lambda a, b, *_: Gtk.Ordering.EQUAL))  # marker only
+        self.col_props[title] = prop
         self.view.append_column(col)
         return col
+
+    def refresh_visible(self):
+        for li in list(self.live):
+            item = li.get_item()
+            if item is not None:
+                li.get_child().set_label(getattr(item, li.prop))
 
     def build_menu(self):
         m = Gio.Menu()
@@ -648,63 +730,117 @@ class Win(Adw.ApplicationWindow):
 
     def selected(self):
         bs = self.selection.get_selection()
-        return [self.selection.get_item(bs.get_nth(i)) for i in range(bs.get_size())]
+        rows = self.model.rows
+        return [rows[bs.get_nth(i)] for i in range(bs.get_size())]
 
     # ---- loading
-    def reload(self):
+    def start(self):
+        """Show the cached list immediately, then refresh it in the background."""
+        self.gen += 1
         self.spin.start()
-        self.clear_queue()
-        threading.Thread(target=self._load, daemon=True).start()
+        threading.Thread(target=self._worker, args=(self.gen, True), daemon=True).start()
 
-    def _load(self):
+    def reload(self, clear=True):
+        self.gen += 1
+        self.spin.start()
+        if clear:
+            self.clear_queue()
+        threading.Thread(target=self._worker, args=(self.gen, False), daemon=True).start()
+
+    def _worker(self, gen, use_cache):
         try:
-            objs = collect_packages()
-            GLib.idle_add(self._loaded, objs)
+            cached = read_cache() if use_cache else None
+            if cached:
+                GLib.idle_add(self._loaded, build_pkgs(cached), gen, False)
+            raw = collect_raw()
+            if cached is not None and raw == cached:
+                GLib.idle_add(self._unchanged, gen)  # nothing new: leave the list alone
+                return
+            write_cache(raw)
+            GLib.idle_add(self._loaded, build_pkgs(raw), gen, True)
         except Exception as e:
-            GLib.idle_add(self._load_failed, str(e))
+            GLib.idle_add(self._load_failed, str(e), gen)
 
-    def _loaded(self, objs):
-        self.store.splice(0, self.store.get_n_items(), objs)
-        self.spin.stop()
+    def _unchanged(self, gen):
+        if gen == self.gen:
+            self.spin.stop()
         return False
 
-    def _load_failed(self, msg):
+    def _loaded(self, objs, gen, final):
+        if gen != self.gen:
+            return False
+        old = {(p.name, p.arch): p.actions for p in self.queue}
+        self.all = objs
+        self.queue = set()
+        if old:  # keep queued actions across the cache -> fresh data swap
+            for p in objs:
+                acts = old.get((p.name, p.arch))
+                if acts:
+                    p.actions = {a for a in acts if action_valid(p, a)}
+                    if p.actions:
+                        self.queue.add(p)
+                        p.refresh()
+            self.update_apply()
+        self.sort_all()
+        self.refilter()
+        if final:
+            self.spin.stop()
+        return False
+
+    def _load_failed(self, msg, gen=None):
+        if gen is not None and gen != self.gen:
+            return False
         self.spin.stop()
         self.toast(f"Failed to load packages: {msg}")
         return False
 
-    # ---- filtering
-    def match(self, p):
-        m = self.mode.get_selected()
-        if m == 1 and not p.installed:
-            return False
-        if m == 2 and p.installed:
-            return False
-        if m == 3 and not p.upgradable:
-            return False
-        if m == 4 and not p.pinned:
-            return False
-        if m == 5 and p not in self.queue:
-            return False
-        return not self.query or self.query in p.hay
+    # ---- sorting / filtering (plain Python on plain lists)
+    def on_sort_changed(self, sorter, _change):
+        col = sorter.get_primary_sort_column()
+        if col is None:
+            return
+        self.sort_prop = self.col_props[col.get_title()]
+        self.sort_desc = sorter.get_primary_sort_order() == Gtk.SortType.DESCENDING
+        self.sort_all()
+        self.refilter()
+
+    def sort_all(self):
+        get = operator.attrgetter(self.sort_prop)
+        self.all.sort(key=lambda p: get(p).casefold(), reverse=self.sort_desc)
 
     def refilter(self):
-        self.filter.changed(Gtk.FilterChange.DIFFERENT)
+        mode = self.mode.get_selected()
+        rows = self.all
+        if mode == 1:
+            rows = [p for p in rows if p.installed]
+        elif mode == 2:
+            rows = [p for p in rows if not p.installed]
+        elif mode == 3:
+            rows = [p for p in rows if p.upgradable]
+        elif mode == 4:
+            rows = [p for p in rows if p.pinned]
+        elif mode == 5:
+            rows = [p for p in rows if p in self.queue]
+        q = self.query
+        if q:
+            rows = [p for p in rows if q in p.hay]
+        elif rows is self.all:
+            rows = list(rows)
+        self.model.set_rows(rows)
+        self.count.set_text(f"{len(rows)} packages")
 
     def on_search(self, entry):
         self.query = entry.get_text().strip().lower()
         self.refilter()
-
-    def on_count(self, model, *_):
-        self.count.set_text(f"{model.get_n_items()} packages")
 
     # ---- details pane
     def available_actions(self, sel):
         return [a for a in ACTIONS
                 if any(action_valid(p, a) or a in p.actions for p in sel)]
 
-    def update_actions(self):
-        sel = self.selected()
+    def update_actions(self, sel=None):
+        if sel is None:
+            sel = self.selected()
         valid = self.available_actions(sel)
         for act, btn in self.action_btns.items():
             btn.set_visible(act in valid)
@@ -731,20 +867,27 @@ class Win(Adw.ApplicationWindow):
         pop.popup()
 
     def on_select(self, *_):
-        self.update_actions()
         sel = self.selected()
+        self.update_actions(sel)
         self.info_token += 1
+        if self.info_timer:
+            GLib.source_remove(self.info_timer)
+            self.info_timer = 0
         if not sel:
             self.info.get_buffer().set_text("Select a package to see its details.")
             return
-        p = sel[0]
-        token = self.info_token
+        # Debounce: holding an arrow key would otherwise spawn one dnf5 process per row.
+        self.info_timer = GLib.timeout_add(250, self._start_info, sel[0], self.info_token)
+
+    def _start_info(self, p, token):
+        self.info_timer = 0
 
         def work():
-            out = run(["dnf5", "info", p.spec])
+            out = dnf5("info", p.spec)
             GLib.idle_add(self.set_info, token, out)
 
         threading.Thread(target=work, daemon=True).start()
+        return False
 
     def set_info(self, token, text):
         if token == self.info_token:
@@ -767,6 +910,7 @@ class Win(Adw.ApplicationWindow):
             else:
                 self.queue.discard(p)
             p.refresh()
+        self.refresh_visible()
         self.update_apply()
         if self.mode.get_selected() == 5:
             self.refilter()
@@ -776,6 +920,7 @@ class Win(Adw.ApplicationWindow):
             p.actions.clear()
             p.refresh()
         self.queue = set()
+        self.refresh_visible()
         self.update_apply()
         if self.mode.get_selected() == 5:
             self.refilter()
@@ -868,7 +1013,7 @@ class App(Adw.Application):
     def do_activate(self):
         win = Win(self)
         win.present()
-        win.reload()
+        win.start()
 
 
 if __name__ == "__main__":
