@@ -20,6 +20,7 @@ get one polkit prompt per transaction. Pins use `dnf5 versionlock`
 import json
 import operator
 import os
+import pwd
 import re
 import shlex
 import shutil
@@ -258,6 +259,46 @@ def emit_settings():
             if "emit_via" in vals:
                 sec, via = name.strip(), [v.strip() for v in vals["emit_via"].split(",") if v.strip()]
     return sec, via
+
+
+GAMEMODE = "com.feralinteractive.GameMode"
+
+
+def gamemode_active():
+    try:
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        reply = bus.call_sync(GAMEMODE, "/com/feralinteractive/GameMode",
+                              "org.freedesktop.DBus.Properties", "Get",
+                              GLib.Variant("(ss)", (GAMEMODE, "ClientCount")), None,
+                              Gio.DBusCallFlags.NO_AUTO_START, 2000, None)
+    except GLib.Error:
+        return False
+    return reply.unpack()[0] > 0
+
+
+def update_blocker():
+    """Why automatic updates should wait, or "". Same checks as GNOME Software, plus GameMode."""
+    if Gio.NetworkMonitor.get_default().get_network_metered():
+        return "the connection is metered"
+    monitor = Gio.PowerProfileMonitor.dup_default()
+    if monitor and monitor.get_power_saver_enabled():
+        return "power saver is on"
+    if gamemode_active():
+        return "GameMode is active"
+    return ""
+
+
+GUARD_FILE = "/etc/systemd/system/dnf5-automatic.service.d/dnfshelf.conf"
+
+
+def guard_unit():
+    """Drop-in that skips the timer's run while update_blocker() says to wait."""
+    uid = os.getuid()
+    check = shlex.join(["runuser", "-u", pwd.getpwuid(uid).pw_name, "--", "env",
+                        f"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus",
+                        sys.executable, os.path.abspath(__file__), "--can-update"])
+    # only exit status 3 means wait, so a broken check can't stop updates for good
+    return f"[Service]\nExecCondition=/bin/sh -c '{check}; [ $$? -ne 3 ]'\n"
 
 
 def notify_enabled():
@@ -1018,6 +1059,20 @@ class AutoUpdatesWindow(Adw.Window):
                 f.write(old)
             # install, not mv: the new file gets the SELinux label of /etc/dnf
             cmds.append(["install", "-m", "644", tmp, AUTO_CONF])
+        if now["enabled"]:
+            unit = guard_unit()
+            try:
+                with open(GUARD_FILE) as f:
+                    have = f.read()
+            except OSError:
+                have = ""
+            if have != unit:
+                tmp = os.path.join(CACHE_DIR, "guard.conf")
+                os.makedirs(CACHE_DIR, exist_ok=True)
+                with open(tmp, "w") as f:
+                    f.write(unit)
+                cmds += [["install", "-D", "-m", "644", tmp, GUARD_FILE],
+                         ["systemctl", "daemon-reload"]]
         if now["enabled"] != self.loaded["enabled"]:
             cmds.append(["systemctl", "enable" if now["enabled"] else "disable", "--now", AUTO_TIMER])
         self.close()
@@ -2062,5 +2117,10 @@ if __name__ == "__main__":
         print(uninstall_launcher())
     elif "--notify" in sys.argv[1:]:
         sys.exit(notify_report())
+    elif "--can-update" in sys.argv[1:]:
+        why = update_blocker()
+        if why:
+            print(f"Automatic update skipped: {why}", file=sys.stderr)
+        sys.exit(3 if why else 0)
     else:
         App().run(None)
