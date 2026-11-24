@@ -1,6 +1,8 @@
 APPSTREAM_DIRS = ("/usr/share/swcatalog", "/var/cache/swcatalog")
 APPSTREAM_CACHE = os.path.join(CACHE_DIR, "appstream.json")
-APP_TYPES = ("desktop-application", "console-application")
+APPSTREAM_FORMAT = 2  # bump when the parsed fields change
+# Pre-0.16 catalogs name desktop apps just "desktop".
+APP_TYPES = ("desktop-application", "console-application", "desktop")
 XML_LANG = "{http://www.w3.org/XML/1998/namespace}lang"
 _apps, _apps_lock = None, threading.Lock()
 
@@ -95,7 +97,7 @@ def build_appstream(langs):
 
 def load_appstream(langs):
     """Catalog index, rebuilt only when a catalog file or the language changed."""
-    sig = [langs]
+    sig = [APPSTREAM_FORMAT, langs]
     for path in appstream_files():
         try:
             st = os.stat(path)
