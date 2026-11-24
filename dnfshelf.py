@@ -291,12 +291,12 @@ def set_notify(on):
     return ""
 
 
-def notify(title, body):
+def notify(title, body, action="app.open"):
     app = Gio.Application(application_id=APP_ID)
     app.register(None)
     note = Gio.Notification.new(title)
     note.set_body(body)
-    note.set_default_action("app.open")
+    note.set_default_action(action)
     app.send_notification("auto-update", note)
     conn = app.get_dbus_connection()
     if conn:
@@ -316,7 +316,8 @@ def notify_report():
     status = reboot_status()
     if status and status[0]:
         lines.append("Restart recommended")
-    notify("Automatic updates", "\n".join(lines))
+    installed = automatic_settings()["mode"] == 2
+    notify("Automatic updates", "\n".join(lines), "app.history" if installed else "app.open")
     return 0
 
 
@@ -464,6 +465,36 @@ def parse_history(text):
         if m:
             out.append((int(m.group(1)), m.group(2), m.group(3), " ".join(m.group(4).split())))
     return out
+
+
+AUTO_RUNS_SHOWN = 30
+PKG_ACTIONS = ("Install", "Upgrade", "Downgrade", "Reinstall", "Remove")
+NEVRA_RE = re.compile(r"^(.+)-(?:\d+:)?[^-]+-[^-]+\.[^.]+$")
+
+
+def auto_run_packages(ids):
+    """{transaction id: [package names]} from one `dnf5 history info --json` call."""
+    if not ids:
+        return {}
+    try:
+        data = json.loads(run(["dnf5", "history", "info", "--json", *map(str, ids)]))
+    except ValueError:
+        return {}
+    out = {}
+    for t in data:
+        names = []
+        for p in t.get("packages", []):
+            if p.get("action") in PKG_ACTIONS:
+                m = NEVRA_RE.match(p.get("nevra", ""))
+                names.append(m.group(1) if m else p.get("nevra", ""))
+        out[t.get("id")] = sorted(set(names))
+    return out
+
+
+def is_auto_run(cmd):
+    """True for transactions started by `dnf5 automatic` (the timer runs it with --timer)."""
+    t = cmd.split()
+    return len(t) > 1 and os.path.basename(t[0]) == "dnf5" and "automatic" in t[1:]
 
 
 ACTIONS = {
@@ -666,7 +697,7 @@ class RunWindow(Adw.Window):
 class HistoryWindow(Adw.Window):
     """Native transaction history with details, undo and rollback."""
 
-    def __init__(self, parent):
+    def __init__(self, parent, auto_only=False):
         super().__init__(transient_for=parent, modal=True, title="Transaction history",
                          default_width=760, default_height=600)
         self.parent_win = parent
@@ -676,21 +707,47 @@ class HistoryWindow(Adw.Window):
                                css_classes=["boxed-list"], margin_top=12, margin_bottom=12,
                                margin_start=12, margin_end=12, valign=Gtk.Align.START)
         self.box.set_placeholder(self.placeholder)
+        self.loaded = False
+        self.box.set_filter_func(lambda row: not self.only_auto.get_active() or row.auto)
+        self.only_auto = Gtk.ToggleButton(label="Automatic only")
+        self.only_auto.set_active(auto_only)
+        self.only_auto.connect("toggled", self._filter)
+        hb = Adw.HeaderBar()
+        hb.pack_start(self.only_auto)
         tb = Adw.ToolbarView()
-        tb.add_top_bar(Adw.HeaderBar())
+        tb.add_top_bar(hb)
         tb.set_content(Gtk.ScrolledWindow(vexpand=True, child=self.box))
         self.set_content(tb)
         threading.Thread(target=self._load, daemon=True).start()
 
-    def _load(self):
-        GLib.idle_add(self._populate, parse_history(run(["dnf5", "history", "list"])))
+    def _filter(self, *_):
+        self.box.invalidate_filter()
+        if self.loaded:
+            self._set_empty_text()
 
-    def _populate(self, items):
-        self.placeholder.set_text("No transactions found")
+    def _set_empty_text(self):
+        self.placeholder.set_text("No automatic runs found" if self.only_auto.get_active()
+                                  else "No transactions found")
+
+    def _load(self):
+        items = parse_history(run(["dnf5", "history", "list"]))
+        recent = [tid for tid, cmd, _w, _a in items if is_auto_run(cmd)]
+        recent = sorted(recent)[-AUTO_RUNS_SHOWN:]
+        GLib.idle_add(self._populate, items, auto_run_packages(recent))
+
+    def _populate(self, items, pkgs):
+        self.loaded = True
+        self._set_empty_text()
         for tid, cmd, when, actions in items:
-            row = Adw.ActionRow(title=GLib.markup_escape_text(cmd or "(no command line)"),
-                                subtitle=GLib.markup_escape_text(f"#{tid} \u00b7 {when} \u00b7 {actions}"),
-                                activatable=True)
+            auto = is_auto_run(cmd)
+            sub = f"#{tid} \u00b7 {when} \u00b7 {actions}"
+            names = pkgs.get(tid)
+            if names:
+                sub += "\n" + ", ".join(names[:8]) + (f" +{len(names) - 8} more" if len(names) > 8 else "")
+            row = Adw.ActionRow(title="Automatic update" if auto
+                                else GLib.markup_escape_text(cmd or "(no command line)"),
+                                subtitle=GLib.markup_escape_text(sub), activatable=True)
+            row.auto = auto
             row.connect("activated", lambda _r, t=tid: self.details(t))
             for icon, tip, fn in (
                     ("edit-undo-symbolic", "Undo this transaction", self.undo),
@@ -1935,6 +1992,16 @@ class App(Adw.Application):
         act = Gio.SimpleAction.new("open", None)
         act.connect("activate", lambda *_: self.activate())
         self.add_action(act)
+        act = Gio.SimpleAction.new("history", None)
+        act.connect("activate", lambda *_: self.show_history())
+        self.add_action(act)
+
+    def show_history(self):
+        win = next((w for w in self.get_windows() if isinstance(w, Win)), None)
+        if not win:
+            self.activate()
+            win = next(w for w in self.get_windows() if isinstance(w, Win))
+        HistoryWindow(win, auto_only=True).present()
 
     def do_activate(self):
         win = Win(self)

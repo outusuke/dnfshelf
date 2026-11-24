@@ -29,7 +29,7 @@ python3 dnfshelf.py
 - Automatic updates through `dnf5 automatic`: check, download or install, all or security only, restart policy, plus GNOME Software's automatic download switch, and desktop notifications that list what was downloaded or installed
 - Groups and environments: install (with optional packages) and remove
 - Repositories: enable, disable, add a local repo
-- Transaction history with undo and rollback
+- Transaction history with undo and rollback, automatic runs marked and filterable
 - Mark packages as user-installed or dependency, autoremove, clean caches
 - Check for updates without a password prompt
 - Banner with a Reboot button when `dnf5 needs-restarting` recommends one
