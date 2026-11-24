@@ -46,6 +46,7 @@ CACHE_DIR = os.path.join(GLib.get_user_cache_dir(), "dnfshelf")
 CACHE_FILE = os.path.join(CACHE_DIR, "packages.json")
 SHOT_TAB = 4
 SHOT_HEIGHT = 160
+SEARCH_MODES = ("Name & description", "Name only", "Word start", "Exact name")
 ICON_PX = 28
 INFO_RULE = "\u2500" * 40
 PKG_QF = r"%{name}\n"

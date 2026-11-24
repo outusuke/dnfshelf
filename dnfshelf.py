@@ -96,6 +96,7 @@ CACHE_DIR = os.path.join(GLib.get_user_cache_dir(), "dnfshelf")
 CACHE_FILE = os.path.join(CACHE_DIR, "packages.json")
 SHOT_TAB = 4
 SHOT_HEIGHT = 160
+SEARCH_MODES = ("Name & description", "Name only", "Word start", "Exact name")
 ICON_PX = 28
 INFO_RULE = "\u2500" * 40
 PKG_QF = r"%{name}\n"
@@ -1827,10 +1828,27 @@ class Win(Adw.ApplicationWindow):
         hb.pack_start(self.check_btn)
         self.spin = Gtk.Spinner()
         hb.pack_start(self.spin)
-        self.search = Gtk.SearchEntry(placeholder_text="Search name or description",
+        self.search = Gtk.SearchEntry(placeholder_text=f"Search \u00b7 {SEARCH_MODES[0]}",
                                       width_request=420)
         self.search.connect("search-changed", self.on_search)
-        hb.set_title_widget(self.search)
+        self.search.get_delegate().set_margin_end(32)  # room for the mode button
+        mode_menu = Gio.Menu()
+        for i, label in enumerate(SEARCH_MODES):
+            item = Gio.MenuItem.new(label, None)
+            item.set_action_and_target_value("win.search-mode", GLib.Variant.new_string(str(i)))
+            mode_menu.append_item(item)
+        mode_btn = Gtk.MenuButton(icon_name="pan-down-symbolic", menu_model=mode_menu,
+                                  tooltip_text="What the search matches", halign=Gtk.Align.END,
+                                  valign=Gtk.Align.CENTER, margin_end=32,
+                                  css_classes=["flat", "circular"])
+        overlay = Gtk.Overlay(child=self.search)
+        overlay.add_overlay(mode_btn)
+        hb.set_title_widget(overlay)
+        self.search_idx = 0
+        mode_act = Gio.SimpleAction.new_stateful("search-mode", GLib.VariantType.new("s"),
+                                                 GLib.Variant.new_string("0"))
+        mode_act.connect("activate", self.on_search_mode)
+        self.add_action(mode_act)
         menu_btn = Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=self.build_menu())
         hb.pack_end(menu_btn)
         self.apply_btn = Gtk.Button(label="Apply", sensitive=False,
@@ -2290,7 +2308,7 @@ class Win(Adw.ApplicationWindow):
                 rows = [p for p in rows if p.installed and (p.name, p.arch) in keys]
         q = self.query
         if q:
-            rows = [p for p in rows if q in p.hay]
+            rows = self.search_rows(rows, q)
         elif rows is self.all:
             rows = list(rows)
         self.model.set_rows(rows)
@@ -2298,6 +2316,23 @@ class Win(Adw.ApplicationWindow):
         text = f"{len(rows)} packages" + (f" \u00b7 {self.n_upg} upgradable" if self.n_upg else "")
         self.count.set_text(("Checking security advisories\u2026" if mode == M_SECURITY
                              else "Loading\u2026") if loading else text)
+
+    def on_search_mode(self, act, value):
+        act.set_state(value)
+        self.search_idx = int(value.get_string())
+        self.search.set_placeholder_text(f"Search \u00b7 {SEARCH_MODES[self.search_idx]}")
+        self.refilter()
+
+    def search_rows(self, rows, q):
+        how = self.search_idx
+        if how == 1:
+            return [p for p in rows if q in p.name.lower()]
+        if how == 2:
+            word = re.compile(r"(?<![a-z0-9])" + re.escape(q))
+            return [p for p in rows if word.search(p.hay)]
+        if how == 3:
+            return [p for p in rows if p.name.lower() == q]
+        return [p for p in rows if q in p.hay]
 
     def fetch_set(self, mode):
         if mode in self.set_loading:
