@@ -303,6 +303,14 @@ def notify(title, body, action="app.open"):
         conn.flush_sync(None)  # we exit right after, so push the message out first
 
 
+def refresh_packagekit():
+    """GNOME Software keeps offering updates dnf already installed until PackageKit refreshes."""
+    try:
+        subprocess.run(["pkcon", "refresh"], capture_output=True, timeout=300)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
 def notify_report():
     try:
         with open(REPORT_FILE) as f:
@@ -318,6 +326,8 @@ def notify_report():
         lines.append("Restart recommended")
     installed = automatic_settings()["mode"] == 2
     notify("Automatic updates", "\n".join(lines), "app.history" if installed else "app.open")
+    if installed:
+        refresh_packagekit()
     return 0
 
 
