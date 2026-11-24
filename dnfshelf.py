@@ -36,6 +36,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango  # noqa: E402
 
+
 APP_ID = "org.outusuke.Dnfshelf"
 VERSIONLOCK_FILE = "/etc/dnf/versionlock.toml"
 AUTO_CONF = "/etc/dnf/automatic.conf"
@@ -156,6 +157,46 @@ def comps_text(kind, sub, *specs, hidden=False):
     """Output of `dnf5 <group|environment> <list|info> [--hidden] [specs]`."""
     flags = ["--hidden"] if hidden and kind == "group" else []
     return dnf5(kind, sub, *flags, *specs, env=WIDE_ENV)
+
+
+BIN_PATH = os.path.expanduser("~/.local/bin/dnfshelf")
+DESKTOP_PATH = os.path.expanduser(f"~/.local/share/applications/{APP_ID}.desktop")
+DESKTOP_ENTRY = """[Desktop Entry]
+Type=Application
+Name=Dnfshelf
+Comment=Synaptic-style package manager for Fedora
+Exec="{exec}"
+Icon=system-software-install
+Terminal=false
+Categories=System;PackageManager;GTK;
+Keywords=dnf;rpm;packages;software;
+StartupWMClass={app_id}
+"""
+
+
+def install_launcher():
+    """Copy this script to ~/.local/bin and add an app-menu entry."""
+    src = os.path.abspath(__file__)
+    os.makedirs(os.path.dirname(BIN_PATH), exist_ok=True)
+    os.makedirs(os.path.dirname(DESKTOP_PATH), exist_ok=True)
+    if not (os.path.exists(BIN_PATH) and os.path.samefile(src, BIN_PATH)):
+        shutil.copyfile(src, BIN_PATH)
+    os.chmod(BIN_PATH, 0o755)
+    with open(DESKTOP_PATH, "w") as f:
+        f.write(DESKTOP_ENTRY.format(exec=BIN_PATH, app_id=APP_ID))
+    if shutil.which("update-desktop-database"):
+        subprocess.run(["update-desktop-database", os.path.dirname(DESKTOP_PATH)],
+                       capture_output=True)
+    return f"Installed {BIN_PATH} and added to the app menu"
+
+
+def uninstall_launcher():
+    removed = []
+    for path in (BIN_PATH, DESKTOP_PATH):
+        if os.path.exists(path):
+            os.remove(path)
+            removed.append(path)
+    return "Removed " + ", ".join(removed) if removed else "Nothing to remove"
 
 
 def load_pins():
@@ -429,11 +470,6 @@ def collect_raw():
     return sorted(pk.values(), key=lambda d: (d[0], d[1]))
 
 
-def build_pkgs(raw):
-    pins = load_pins()
-    return [Pkg(d, d[0] in pins) for d in raw]
-
-
 def _fold_cap(c):
     """One readable line per library; drop rpm/loader internals."""
     c = c.strip()
@@ -655,6 +691,11 @@ class PkgModel(GObject.Object, Gio.ListModel):
         removed = len(self.rows)
         self.rows = rows
         self.items_changed(0, removed, len(rows))
+
+
+def build_pkgs(raw):
+    pins = load_pins()
+    return [Pkg(d, d[0] in pins) for d in raw]
 
 
 # ---------------------------------------------------------------- run window
@@ -2049,46 +2090,6 @@ class Win(Adw.ApplicationWindow):
             return
         self.quiet(f"Marked {len(names)} package(s) as {label}",
                    ["pkexec", "dnf5", "mark", kind, *names], reload=False)
-
-
-BIN_PATH = os.path.expanduser("~/.local/bin/dnfshelf")
-DESKTOP_PATH = os.path.expanduser(f"~/.local/share/applications/{APP_ID}.desktop")
-DESKTOP_ENTRY = """[Desktop Entry]
-Type=Application
-Name=Dnfshelf
-Comment=Synaptic-style package manager for Fedora
-Exec="{exec}"
-Icon=system-software-install
-Terminal=false
-Categories=System;PackageManager;GTK;
-Keywords=dnf;rpm;packages;software;
-StartupWMClass={app_id}
-"""
-
-
-def install_launcher():
-    """Copy this script to ~/.local/bin and add an app-menu entry."""
-    src = os.path.abspath(__file__)
-    os.makedirs(os.path.dirname(BIN_PATH), exist_ok=True)
-    os.makedirs(os.path.dirname(DESKTOP_PATH), exist_ok=True)
-    if not (os.path.exists(BIN_PATH) and os.path.samefile(src, BIN_PATH)):
-        shutil.copyfile(src, BIN_PATH)
-    os.chmod(BIN_PATH, 0o755)
-    with open(DESKTOP_PATH, "w") as f:
-        f.write(DESKTOP_ENTRY.format(exec=BIN_PATH, app_id=APP_ID))
-    if shutil.which("update-desktop-database"):
-        subprocess.run(["update-desktop-database", os.path.dirname(DESKTOP_PATH)],
-                       capture_output=True)
-    return f"Installed {BIN_PATH} and added to the app menu"
-
-
-def uninstall_launcher():
-    removed = []
-    for path in (BIN_PATH, DESKTOP_PATH):
-        if os.path.exists(path):
-            os.remove(path)
-            removed.append(path)
-    return "Removed " + ", ".join(removed) if removed else "Nothing to remove"
 
 
 class App(Adw.Application):

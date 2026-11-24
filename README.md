@@ -44,6 +44,10 @@ python3 dnfshelf.py
 - Automatic updates are set in `/etc/dnf/automatic.conf` and run by `dnf5-automatic.timer` (package `dnf5-plugin-automatic`).
 - Notifications: `dnf5 automatic` writes its report to `/var/lib/dnfshelf/report.txt` through its `command` emitter, and a systemd user path unit (`dnfshelf-notify.path`) shows it as a desktop notification. They only appear while you are logged in.
 
+## Development
+
+`dnfshelf.py` is built from the fragments in `src/` by `build.py` and the built file is committed, so the install is still one file. Edit `src/`, run `python3 build.py`; `python3 build.py --check` fails if `dnfshelf.py` is stale. A fragment may only use names from its own or a lower layer (list in `build.py`).
+
 ## License
 
 GPL-3.0-or-later. See [LICENSE](LICENSE).
