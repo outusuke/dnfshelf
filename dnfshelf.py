@@ -297,8 +297,12 @@ def guard_unit():
     check = shlex.join(["runuser", "-u", pwd.getpwuid(uid).pw_name, "--", "env",
                         f"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus",
                         sys.executable, os.path.abspath(__file__), "--can-update"])
+    retry = ("systemd-run --quiet --collect --on-active=30min --unit=dnfshelf-retry /bin/sh -c "
+             f'"systemctl is-enabled --quiet {AUTO_TIMER} && systemctl --no-block start '
+             'dnf5-automatic.service"')
     # only exit status 3 means wait, so a broken check can't stop updates for good
-    return f"[Service]\nExecCondition=/bin/sh -c '{check}; [ $$? -ne 3 ]'\n"
+    return (f"[Service]\nExecCondition=/bin/sh -c '{check}; r=$$?; "
+            f"[ $$r -ne 3 ] || {{ {retry}; exit 1; }}'\n")
 
 
 def notify_enabled():
