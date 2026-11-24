@@ -26,7 +26,7 @@ python3 dnfshelf.py
 - Queue several changes, then apply them in one transaction: install, remove, upgrade, reinstall, downgrade
 - Dry run before Apply, Upgrade all and security-only upgrades
 - Pin or block a package (`dnf5 versionlock`), with a window to review and remove pins
-- Automatic updates through `dnf5 automatic`: check, download or install, all or security only, restart policy, plus GNOME Software's automatic download switch
+- Automatic updates through `dnf5 automatic`: check, download or install, all or security only, restart policy, plus GNOME Software's automatic download switch, and desktop notifications that list what was downloaded or installed
 - Groups and environments: install (with optional packages) and remove
 - Repositories: enable, disable, add a local repo
 - Transaction history with undo and rollback
@@ -42,6 +42,7 @@ python3 dnfshelf.py
 - `--allowerasing` is never a setting. It is offered only after a dry run fails, for that transaction only.
 - Pins live in `/etc/dnf/versionlock.toml`.
 - Automatic updates are set in `/etc/dnf/automatic.conf` and run by `dnf5-automatic.timer` (package `dnf5-plugin-automatic`).
+- Notifications: `dnf5 automatic` writes its report to `/var/lib/dnfshelf/report.txt` through its `command` emitter, and a systemd user path unit (`dnfshelf-notify.path`) shows it as a desktop notification. They only appear while you are logged in.
 
 ## License
 

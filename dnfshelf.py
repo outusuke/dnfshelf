@@ -52,6 +52,26 @@ AUTO_MODE_HINTS = ["Only reports what is available",
                    "Installs updates without asking"]
 AUTO_SCOPES = {"default": "All updates", "security": "Security updates only"}
 AUTO_REBOOTS = {"never": "Never", "when-needed": "When needed", "when-changed": "After any update"}
+REPORT_FILE = "/var/lib/dnfshelf/report.txt"
+UNIT_DIR = os.path.join(GLib.get_user_config_dir(), "systemd", "user")
+NOTIFY_PATH = "dnfshelf-notify.path"
+NOTIFY_SERVICE = "dnfshelf-notify.service"
+NOTIFY_PATH_UNIT = """[Unit]
+Description=Notify when dnf5 automatic has run (Dnfshelf)
+
+[Path]
+PathChanged={report}
+
+[Install]
+WantedBy=default.target
+"""
+NOTIFY_SERVICE_UNIT = """[Unit]
+Description=Show the dnf5 automatic report (Dnfshelf)
+
+[Service]
+Type=oneshot
+ExecStart={exe} --notify
+"""
 GS_NOTE = "Separate from the timer above. It also covers Flatpaks, which dnf5 automatic does not."
 GS_BOTH = "Both are on and will update the same packages. Turn one off."
 QF = r"%{name}|%{evr}|%{arch}|%{repoid}|%{summary}\n"
@@ -222,6 +242,79 @@ def timer_state():
     except OSError:
         return False, False, ""
     return have, enabled, nxt
+
+
+def emit_settings():
+    """(section, emit_via list) as dnf5 automatic will read them."""
+    sec, via = "emitters", ["stdio"]
+    for path in (AUTO_DEFAULTS_CONF, AUTO_CONF):
+        try:
+            with open(path) as f:
+                text = f.read()
+        except OSError:
+            continue
+        for name in re.findall(r"^\s*\[([^\]]+)\]", text, re.M):
+            vals = ini_values(text, name.strip())
+            if "emit_via" in vals:
+                sec, via = name.strip(), [v.strip() for v in vals["emit_via"].split(",") if v.strip()]
+    return sec, via
+
+
+def notify_enabled():
+    try:
+        r = subprocess.run(["systemctl", "--user", "is-enabled", NOTIFY_PATH],
+                           capture_output=True, text=True)
+    except OSError:
+        return False
+    return r.stdout.strip() == "enabled"
+
+
+def set_notify(on):
+    """Write and enable (or disable) the user path unit; returns an error message or ""."""
+    try:
+        if on:
+            if not os.path.exists(BIN_PATH):
+                install_launcher()  # the unit runs the installed copy of this script
+            os.makedirs(UNIT_DIR, exist_ok=True)
+            for name, text in ((NOTIFY_SERVICE, NOTIFY_SERVICE_UNIT.format(exe=BIN_PATH)),
+                               (NOTIFY_PATH, NOTIFY_PATH_UNIT.format(report=REPORT_FILE))):
+                with open(os.path.join(UNIT_DIR, name), "w") as f:
+                    f.write(text)
+        steps = [["daemon-reload"], ["enable", "--now", NOTIFY_PATH]] if on \
+            else [["disable", "--now", NOTIFY_PATH]]
+        for step in steps:
+            r = subprocess.run(["systemctl", "--user", *step], capture_output=True, text=True)
+            if r.returncode:
+                return (r.stderr or r.stdout).strip() or f"systemctl exited with {r.returncode}"
+    except OSError as e:
+        return str(e)
+    return ""
+
+
+def notify(title, body):
+    app = Gio.Application(application_id=APP_ID)
+    app.register(None)
+    note = Gio.Notification.new(title)
+    note.set_body(body)
+    note.set_default_action("app.open")
+    app.send_notification("auto-update", note)
+    conn = app.get_dbus_connection()
+    if conn:
+        conn.flush_sync(None)  # we exit right after, so push the message out first
+
+
+def notify_report():
+    try:
+        with open(REPORT_FILE) as f:
+            lines = [ln.rstrip() for ln in f if ln.strip()]
+    except OSError:
+        return 1
+    if not lines:
+        return 0
+    if len(lines) > 12:
+        lines[12:] = [f"\u2026 and {len(lines) - 12} more lines"]
+    notify("Automatic updates", "\n".join(lines))
+    return 0
 
 
 def gnome_software_settings():
@@ -694,6 +787,7 @@ class AutoUpdatesWindow(Adw.Window):
         self.reboots = list(AUTO_REBOOTS) + [v for v in [cfg["reboot"]] if v not in AUTO_REBOOTS]
         self.loaded = {"enabled": enabled, "mode": cfg["mode"],
                        "gnome": bool(self.gs and self.gs.get_boolean("download-updates")),
+                       "notify": notify_enabled(),
                        "scope": self.scopes.index(cfg["scope"]),
                        "reboot": self.reboots.index(cfg["reboot"])}
 
@@ -724,6 +818,10 @@ class AutoUpdatesWindow(Adw.Window):
         self.mode_row = self.combo("Mode", AUTO_MODE_LABELS, self.loaded["mode"])
         self.scope_row = self.combo("Which updates", [AUTO_SCOPES.get(v, f"{v} (current config)")
                                                 for v in self.scopes], self.loaded["scope"])
+        self.notify_sw = Adw.SwitchRow(title="Desktop notifications", active=self.loaded["notify"],
+                                       subtitle="Shows what was downloaded or installed")
+        self.notify_sw.connect("notify::active", lambda *_: self.refresh())
+        sched.add(self.notify_sw)
         what = Adw.PreferencesGroup(title="Updates")
         what.add(self.mode_row)
         what.add(self.scope_row)
@@ -763,7 +861,8 @@ class AutoUpdatesWindow(Adw.Window):
     def current(self):
         return {"enabled": self.sw.get_active(), "mode": self.mode_row.get_selected(),
                 "scope": self.scope_row.get_selected(), "reboot": self.reboot_row.get_selected(),
-                "gnome": bool(self.gs and self.gs_row.get_active())}
+                "gnome": bool(self.gs and self.gs_row.get_active()),
+                "notify": self.notify_sw.get_active()}
 
     def refresh(self):
         now = self.current()
@@ -785,7 +884,20 @@ class AutoUpdatesWindow(Adw.Window):
         if self.gs and now["gnome"] != self.loaded["gnome"]:
             self.gs.set_boolean("download-updates", now["gnome"])
         cmds = []
-        if vals:
+        edits = [("commands", vals)]
+        if now["notify"] != self.loaded["notify"]:
+            err = set_notify(now["notify"])
+            if err:
+                self.close()
+                self.parent_win.toast(f"Failed: {err}")
+                return
+        if now["notify"] and not self.loaded["notify"]:
+            sec, via = emit_settings()
+            if "command" not in via:
+                edits += [(sec, {"emit_via": ",".join(via + ["command"])}),
+                          ("command", {"command_format": f"cat > {REPORT_FILE}"})]
+            cmds.append(["install", "-d", "-m", "755", os.path.dirname(REPORT_FILE)])
+        if any(v for _s, v in edits):
             try:
                 with open(AUTO_CONF) as f:
                     old = f.read()
@@ -793,8 +905,11 @@ class AutoUpdatesWindow(Adw.Window):
                 old = ""
             os.makedirs(CACHE_DIR, exist_ok=True)
             tmp = os.path.join(CACHE_DIR, "automatic.conf")
+            for name, v in edits:
+                if v:
+                    old = set_ini_keys(old, name, v)
             with open(tmp, "w") as f:
-                f.write(set_ini_keys(old, "commands", vals))
+                f.write(old)
             # install, not mv: the new file gets the SELinux label of /etc/dnf
             cmds.append(["install", "-m", "644", tmp, AUTO_CONF])
         if now["enabled"] != self.loaded["enabled"]:
@@ -1814,6 +1929,9 @@ def uninstall_launcher():
 class App(Adw.Application):
     def __init__(self):
         super().__init__(application_id=APP_ID)
+        act = Gio.SimpleAction.new("open", None)
+        act.connect("activate", lambda *_: self.activate())
+        self.add_action(act)
 
     def do_activate(self):
         win = Win(self)
@@ -1826,5 +1944,7 @@ if __name__ == "__main__":
         print(install_launcher())
     elif "--uninstall" in sys.argv[1:]:
         print(uninstall_launcher())
+    elif "--notify" in sys.argv[1:]:
+        sys.exit(notify_report())
     else:
         App().run(None)
