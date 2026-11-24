@@ -340,6 +340,29 @@ def gnome_software_settings():
     return None
 
 
+GS_SERVICE = "gnome-software.service"
+
+
+def gs_paused():
+    try:
+        r = subprocess.run(["systemctl", "--user", "is-enabled", GS_SERVICE],
+                           capture_output=True, text=True)
+    except OSError:
+        return False
+    return r.stdout.strip() == "masked"
+
+
+def set_gs_paused(on):
+    """Mask or unmask GNOME Software's background service; returns an error message or ""."""
+    verb = ["mask", "--now"] if on else ["unmask"]
+    try:
+        r = subprocess.run(["systemctl", "--user", *verb, GS_SERVICE],
+                           capture_output=True, text=True)
+    except OSError as e:
+        return str(e)
+    return "" if r.returncode == 0 else (r.stderr or r.stdout).strip() or f"systemctl exited with {r.returncode}"
+
+
 def collect_raw():
     """[[name, arch, avail, inst, repo, summary, upgradable(0/1)]] sorted by name."""
     with ThreadPoolExecutor(max_workers=3) as ex:  # the three queries are independent
@@ -857,6 +880,7 @@ class AutoUpdatesWindow(Adw.Window):
         self.reboots = list(AUTO_REBOOTS) + [v for v in [cfg["reboot"]] if v not in AUTO_REBOOTS]
         self.loaded = {"enabled": enabled, "mode": cfg["mode"],
                        "gnome": bool(self.gs and self.gs.get_boolean("download-updates")),
+                       "gs_paused": bool(self.gs and gs_paused()),
                        "notify": notify_enabled(),
                        "scope": self.scopes.index(cfg["scope"]),
                        "reboot": self.reboots.index(cfg["reboot"])}
@@ -914,6 +938,11 @@ class AutoUpdatesWindow(Adw.Window):
             self.gs_row.connect("notify::active", lambda *_: self.refresh())
             self.gs_group = Adw.PreferencesGroup(title="GNOME Software", description=GS_NOTE)
             self.gs_group.add(self.gs_row)
+            self.gs_pause = Adw.SwitchRow(title="Pause background activity",
+                                          subtitle="Stops its background refresh and its own notifications",
+                                          active=self.loaded["gs_paused"])
+            self.gs_pause.connect("notify::active", lambda *_: self.refresh())
+            self.gs_group.add(self.gs_pause)
             page.add(self.gs_group)
         tb = Adw.ToolbarView()
         tb.add_top_bar(hb)
@@ -932,6 +961,7 @@ class AutoUpdatesWindow(Adw.Window):
         return {"enabled": self.sw.get_active(), "mode": self.mode_row.get_selected(),
                 "scope": self.scope_row.get_selected(), "reboot": self.reboot_row.get_selected(),
                 "gnome": bool(self.gs and self.gs_row.get_active()),
+                "gs_paused": bool(self.gs and self.gs_pause.get_active()),
                 "notify": self.notify_sw.get_active()}
 
     def refresh(self):
@@ -953,6 +983,12 @@ class AutoUpdatesWindow(Adw.Window):
             vals["reboot"] = self.reboots[now["reboot"]]
         if self.gs and now["gnome"] != self.loaded["gnome"]:
             self.gs.set_boolean("download-updates", now["gnome"])
+        if self.gs and now["gs_paused"] != self.loaded["gs_paused"]:
+            err = set_gs_paused(now["gs_paused"])
+            if err:
+                self.close()
+                self.parent_win.toast(f"Failed: {err}")
+                return
         cmds = []
         edits = [("commands", vals)]
         if now["notify"] != self.loaded["notify"]:
