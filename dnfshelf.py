@@ -313,6 +313,9 @@ def notify_report():
         return 0
     if len(lines) > 12:
         lines[12:] = [f"\u2026 and {len(lines) - 12} more lines"]
+    status = reboot_status()
+    if status and status[0]:
+        lines.append("Restart recommended")
     notify("Automatic updates", "\n".join(lines))
     return 0
 
