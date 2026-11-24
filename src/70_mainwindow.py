@@ -569,7 +569,7 @@ class Win(Adw.ApplicationWindow):
         key = (p.spec, p.installed, idx)
         buf = self.tab_views[idx].get_buffer()
         if key in self.detail_cache:
-            buf.set_text(self.detail_cache[key])
+            self.show_text(idx, p, self.detail_cache[key])
             return
         buf.set_text("Loading\u2026")
 
@@ -586,9 +586,20 @@ class Win(Adw.ApplicationWindow):
         if len(self.detail_cache) > 400:
             self.detail_cache.clear()
         self.detail_cache[key] = text
-        if token == self.info_token:
-            self.tab_views[idx].get_buffer().set_text(text)
+        if token == self.info_token and self.cur is not None:
+            self.show_text(idx, self.cur, text)
         return False
+
+    def show_text(self, idx, p, text):
+        buf = self.tab_views[idx].get_buffer()
+        buf.set_text(text)
+        icon = appstream_icon(p.name) if idx == 0 else ""
+        if icon:
+            try:
+                buf.insert_paintable(buf.get_start_iter(), Gdk.Texture.new_from_filename(icon))
+                buf.insert(buf.get_iter_at_offset(1), "\n")
+            except GLib.Error:
+                pass
 
     # ---- queue
     def mark(self, action):

@@ -22,7 +22,7 @@ python3 dnfshelf.py
 ## Features
 
 - Package list with search, sorting and filter modes: All, Installed, Not installed, Upgradable, Queued changes, Security updates, User-installed, Unneeded, Leaves, Extras
-- Details tabs: Info, Dependencies, Files, Changelog
+- Details tabs: Info (with the AppStream description and icon for apps), Dependencies, Files, Changelog
 - Queue several changes, then apply them in one transaction: install, remove, upgrade, reinstall, downgrade
 - Dry run before Apply, Upgrade all and security-only upgrades
 - Pin or block a package (`dnf5 versionlock`), with a window to review and remove pins

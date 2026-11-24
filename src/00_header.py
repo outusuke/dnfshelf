@@ -17,6 +17,7 @@ Everything goes through the dnf5 CLI. Privileged operations use pkexec, so you
 get one polkit prompt per transaction. Pins use `dnf5 versionlock`
 (state in /etc/dnf/versionlock.toml).
 """
+import gzip
 import json
 import operator
 import os
@@ -28,6 +29,7 @@ import subprocess
 import sys
 import threading
 import tomllib
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 
 import gi
