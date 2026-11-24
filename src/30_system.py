@@ -176,13 +176,15 @@ def set_notify(on):
     return ""
 
 
-def notify(title, body, action="app.open"):
+def notify(notes):
+    """notes: [(id, title, body, action)], all sent from one registered app."""
     app = Gio.Application(application_id=APP_ID)
     app.register(None)
-    note = Gio.Notification.new(title)
-    note.set_body(body)
-    note.set_default_action(action)
-    app.send_notification("auto-update", note)
+    for nid, title, body, action in notes:
+        note = Gio.Notification.new(title)
+        note.set_body(body)
+        note.set_default_action(action)
+        app.send_notification(nid, note)
     conn = app.get_dbus_connection()
     if conn:
         conn.flush_sync(None)  # we exit right after, so push the message out first
@@ -196,6 +198,38 @@ def refresh_packagekit():
         pass
 
 
+REPORT_SECTION = re.compile(r"^(Installing|Upgrading|Downgrading|Reinstalling|Removing)\b[^:]*:\s*$")
+REPORT_ROW = re.compile(r"^\s+(\S+)\s+\S+\s+\d+:\S+\s")
+DONE_VERBS = {"Installing": "Installed", "Upgrading": "Upgraded", "Downgrading": "Downgraded",
+              "Reinstalling": "Reinstalled", "Removing": "Removed"}
+
+
+def report_packages(lines):
+    """{verb: [package names]} from the transaction table in the dnf5 report."""
+    out, cur = {}, None
+    for ln in lines:
+        m = REPORT_SECTION.match(ln)
+        if m:
+            cur = out.setdefault(m.group(1), [])
+        elif cur is not None and not ln.lstrip().startswith("replacing"):
+            r = REPORT_ROW.match(ln)
+            if r:
+                cur.append(r.group(1))
+    return {v: n for v, n in out.items() if n}
+
+
+def report_summary(lines, mode):
+    """Package names instead of the raw report, or "" if the table was not found."""
+    groups = report_packages(lines)
+    if not groups:
+        return ""
+    show = lambda names: ", ".join(names[:8]) + (f" +{len(names) - 8} more" if len(names) > 8 else "")
+    if mode == 2:
+        return "\n".join(f"{DONE_VERBS[v]}: {show(n)}" for v, n in groups.items())
+    names = [x for n in groups.values() for x in n]
+    return f"{'Downloaded' if mode == 1 else 'Available'} ({len(names)}): {show(names)}"
+
+
 def notify_report():
     try:
         with open(REPORT_FILE) as f:
@@ -204,13 +238,20 @@ def notify_report():
         return 1
     if not lines:
         return 0
-    if len(lines) > 12:
-        lines[12:] = [f"\u2026 and {len(lines) - 12} more lines"]
+    mode = automatic_settings()["mode"]
+    installed = mode == 2
+    body = report_summary(lines, mode)
+    if not body:
+        if len(lines) > 12:
+            lines[12:] = [f"\u2026 and {len(lines) - 12} more lines"]
+        body = "\n".join(lines)
+    notes = [("auto-update", "Automatic updates", body, "app.history" if installed else "app.open")]
     status = reboot_status()
     if status and status[0]:
-        lines.append("Restart recommended")
-    installed = automatic_settings()["mode"] == 2
-    notify("Automatic updates", "\n".join(lines), "app.history" if installed else "app.open")
+        names = ", ".join(status[1][:3]) + (" and more" if len(status[1]) > 3 else "")
+        notes.append(("reboot", "Restart recommended", names or "Restart to finish the updates",
+                      "app.open"))
+    notify(notes)
     if installed:
         refresh_packagekit()
     return 0
