@@ -25,6 +25,7 @@ class Win(Adw.ApplicationWindow):
         # header bar
         hb = Adw.HeaderBar()
         self.mode = Gtk.DropDown.new_from_strings(MODES)
+        self.mode.set_selected(M_USER)
         self.mode.connect("notify::selected", lambda *_: self.refilter())
         hb.pack_start(self.mode)
         self.check_btn = Gtk.Button(icon_name="view-refresh-symbolic",
