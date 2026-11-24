@@ -1,10 +1,20 @@
 APPSTREAM_DIRS = ("/usr/share/swcatalog", "/var/cache/swcatalog")
 APPSTREAM_CACHE = os.path.join(CACHE_DIR, "appstream.json")
-APPSTREAM_FORMAT = 2  # bump when the parsed fields change
+APPSTREAM_FORMAT = 4  # bump when the parsed fields change
 # Pre-0.16 catalogs name desktop apps just "desktop".
 APP_TYPES = ("desktop-application", "console-application", "desktop")
 XML_LANG = "{http://www.w3.org/XML/1998/namespace}lang"
+SHOT_DIR = os.path.join(CACHE_DIR, "screenshots")
+SHOT_MAX_BYTES = 5 * 1024 * 1024
+SHOT_MAX_PIXELS = 16_000_000
+SHOT_MAX_WIDTH = 640
+SHOT_TIMEOUT = 10
+SHOT_DEADLINE = 20
+SHOT_KEEP = 200
+SHOT_LIMIT = 8
 _apps, _apps_lock = None, threading.Lock()
+_shot_failed = set()
+_textures = {}
 
 
 def ui_languages():
@@ -56,6 +66,20 @@ def _safe_name(s):
     return bool(s) and os.path.basename(s) == s and s not in (".", "..")
 
 
+def _screenshots(comp, langs):
+    shots = comp.findall("screenshots/screenshot")
+    shots.sort(key=lambda s: s.get("type") != "default")
+    out = []
+    for shot in shots:
+        for img in shot.findall("image"):
+            url = (img.text or "").strip()
+            if img.get("type", "source") == "source" and url.startswith("https://") and len(url) <= 2048:
+                cap = _localized(shot, "caption", langs)
+                out.append([_flat(cap) if cap is not None else "", url])
+                break
+    return out[:SHOT_LIMIT]
+
+
 def parse_appstream(stream, langs):
     """{package name: metadata} from one AppStream catalog file."""
     out, origin = {}, ""
@@ -74,7 +98,8 @@ def parse_appstream(stream, langs):
                         "homepage": next((u.text or "" for u in el.findall("url")
                                           if u.get("type") == "homepage"), ""),
                         "categories": [c.text for c in el.findall("categories/category") if c.text],
-                        "icon": [origin, icon] if _safe_name(origin) and _safe_name(icon) else []}
+                        "icon": [origin, icon] if _safe_name(origin) and _safe_name(icon) else [],
+                        "screenshots": _screenshots(el, langs)}
                 for pkg in el.findall("pkgname"):
                     if pkg.text:
                         out.setdefault(pkg.text, meta)
@@ -142,15 +167,132 @@ def appstream_text(name):
     return "\n\n".join(x for x in (head, meta["description"], facts) if x)
 
 
-def appstream_icon(name):
+def appstream_icon(name, sizes=("128x128", "64x64")):
     """Icon file for a package, only if the catalog is already loaded (never blocks the UI)."""
     meta = (_apps or {}).get(name)
     if not meta or not meta["icon"]:
         return ""
     origin, filename = meta["icon"]
     for base in APPSTREAM_DIRS:
-        for size in ("128x128", "64x64"):
+        for size in sizes:
             path = os.path.join(base, "icons", origin, size, filename)
             if os.path.isfile(path):
                 return path
+    return ""
+
+
+def appstream_screenshots(name):
+    meta = (_apps or {}).get(name)
+    return meta["screenshots"] if meta else []
+
+
+def texture_from(path):
+    if path not in _textures:
+        if len(_textures) > 600:
+            _textures.clear()
+        try:
+            _textures[path] = Gdk.Texture.new_from_filename(path)
+        except GLib.Error:
+            _textures[path] = None
+    return _textures[path]
+
+
+def screenshot_path(url):
+    return os.path.join(SHOT_DIR, hashlib.sha256(url.encode()).hexdigest() + ".png")
+
+
+def _public_host(host, port):
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        addrs = [ipaddress.ip_address(i[4][0].split("%")[0]) for i in infos]
+    except (OSError, ValueError):
+        return False
+    return bool(addrs) and all((getattr(a, "ipv4_mapped", None) or a).is_global for a in addrs)
+
+
+def screenshot_url_ok(url):
+    """Catalog URLs are untrusted: public https hosts only."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        port = parts.port or 443
+    except ValueError:
+        return False
+    return (parts.scheme == "https" and len(url) <= 2048 and bool(parts.hostname)
+            and not (parts.username or parts.password) and _public_host(parts.hostname, port))
+
+
+class _HttpsOnly(urllib.request.HTTPRedirectHandler):
+    max_redirections = 3
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not screenshot_url_ok(urllib.parse.urljoin(req.full_url, newurl)):
+            raise urllib.error.URLError("redirect refused")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _download(url, dest):
+    req = urllib.request.Request(url, headers={"User-Agent": "Dnfshelf", "Accept": "image/png, image/jpeg"})
+    end = time.monotonic() + SHOT_DEADLINE
+    size = 0
+    with urllib.request.build_opener(_HttpsOnly).open(req, timeout=SHOT_TIMEOUT) as resp, \
+            open(dest, "wb") as out:
+        if int(resp.headers.get("Content-Length") or 0) > SHOT_MAX_BYTES:
+            return False
+        while chunk := resp.read(65536):
+            size += len(chunk)
+            if size > SHOT_MAX_BYTES or time.monotonic() > end:
+                return False
+            out.write(chunk)
+    return size > 0
+
+
+def _normalize_image(src, dest):
+    # Header first: a tiny file can declare a huge image.
+    fmt, width, height = GdkPixbuf.Pixbuf.get_file_info(src)
+    if fmt is None or fmt.get_name() not in ("png", "jpeg") or width < 1 or height < 1 \
+            or width * height > SHOT_MAX_PIXELS:
+        return False
+    pix = GdkPixbuf.Pixbuf.new_from_file_at_scale(src, min(width, SHOT_MAX_WIDTH), -1, True)
+    return pix.savev(dest, "png", [], [])
+
+
+def _remove(*paths):
+    for path in paths:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def prune_screenshots():
+    try:
+        files = sorted((os.path.getmtime(p), p) for p in
+                       (os.path.join(SHOT_DIR, n) for n in os.listdir(SHOT_DIR) if n.endswith(".png")))
+    except OSError:
+        return
+    _remove(*(p for _, p in files[:-SHOT_KEEP]))
+
+
+def fetch_screenshot(url):
+    """Cached PNG path for a screenshot URL, or "" on any failure."""
+    path = screenshot_path(url)
+    if os.path.isfile(path):
+        return path
+    if url in _shot_failed or not screenshot_url_ok(url):
+        return ""
+    raw = tmp = ""
+    try:
+        os.makedirs(SHOT_DIR, exist_ok=True)
+        fd, raw = tempfile.mkstemp(dir=SHOT_DIR, suffix=".dl")
+        os.close(fd)
+        tmp = raw + ".png"
+        if _download(url, raw) and _normalize_image(raw, tmp):
+            os.replace(tmp, path)
+            prune_screenshots()
+            return path
+    except Exception:
+        pass
+    finally:
+        _remove(raw, tmp)
+    _shot_failed.add(url)
     return ""

@@ -10,6 +10,7 @@ class Win(Adw.ApplicationWindow):
         self.info_timer = 0
         self.gen = 0           # load generation, so stale loads are ignored
         self.live = set()      # currently bound Status/Queued cells
+        self.icon_cells = set()  # currently bound Name cells
         self.sort_prop, self.sort_desc = "name", False
         self.col_props = {}
         self.cur = None        # package shown in the details pane
@@ -49,7 +50,7 @@ class Win(Adw.ApplicationWindow):
         self.view = Gtk.ColumnView(show_row_separators=True)
         self.add_col("Status", "status", width=120)
         self.add_col("Queued", "queued", width=110)
-        name_col = self.add_col("Name", "name", width=260)
+        name_col = self.add_col("Name", "name", width=260, icon=True)
         self.add_col("Version", "version", width=190)
         self.add_col("Latest", "latest", width=190)
         self.add_col("Repo", "repo", width=130)
@@ -88,6 +89,7 @@ class Win(Adw.ApplicationWindow):
             self.notebook.append_page(
                 Gtk.ScrolledWindow(vexpand=True, min_content_height=170, child=tv),
                 Gtk.Label(label=title))
+        self.notebook.append_page(self.build_shot_tab(), Gtk.Label(label="Screenshots"))
         self.notebook.connect("switch-page", self.on_tab_switch)
         bottom = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         bottom.append(bar)
@@ -106,10 +108,11 @@ class Win(Adw.ApplicationWindow):
         self.overlay = Adw.ToastOverlay(child=tb)
         self.set_content(self.overlay)
         self.install_actions()
+        threading.Thread(target=self.load_catalog, daemon=True).start()
         self.view.sort_by_column(name_col, Gtk.SortType.ASCENDING)  # last: needs self.count
 
     # ---- UI helpers
-    def add_col(self, title, prop, width=None, expand=False):
+    def add_col(self, title, prop, width=None, expand=False, icon=False):
         f = Gtk.SignalListItemFactory()
         live = prop in ("status", "queued")  # the only cells that change after load
 
@@ -120,13 +123,23 @@ class Win(Adw.ApplicationWindow):
             click = Gtk.GestureClick(button=3)
             click.connect("pressed", lambda g, n, x, y, li=li, w=lbl: self.context_menu(li, w, x, y))
             lbl.add_controller(click)
-            li.set_child(lbl)
+            if not icon:
+                li.set_child(lbl)
+                return
+            box = Gtk.Box(spacing=4, margin_start=4)
+            box.append(Gtk.Image(pixel_size=ICON_PX))
+            box.append(lbl)
+            li.set_child(box)
 
         def bind(_f, li):
             text = getattr(li.get_item(), prop)
-            lbl = li.get_child()
+            child = li.get_child()
+            lbl = child.get_last_child() if icon else child
             if lbl.get_label() != text:
                 lbl.set_label(text)
+            if icon:
+                self.icon_cells.add(li)
+                self.bind_icon(li)
             if live:
                 li.prop = prop
                 self.live.add(li)
@@ -134,6 +147,8 @@ class Win(Adw.ApplicationWindow):
         def unbind(_f, li):
             if live:
                 self.live.discard(li)
+            if icon:
+                self.icon_cells.discard(li)
 
         f.connect("setup", setup)
         f.connect("bind", bind)
@@ -145,6 +160,24 @@ class Win(Adw.ApplicationWindow):
         self.col_props[title] = prop
         self.view.append_column(col)
         return col
+
+    def bind_icon(self, li):
+        img = li.get_child().get_first_child()
+        tex = pkg_icon(li.get_item())
+        if tex:
+            img.set_from_paintable(tex)
+        else:
+            img.set_from_icon_name("package-x-generic-symbolic")
+        img.set_opacity(1.0 if tex else 0.45)
+
+    def load_catalog(self):
+        appstream_apps()
+        GLib.idle_add(self.icons_ready)
+
+    def icons_ready(self):
+        for li in list(self.icon_cells):
+            self.bind_icon(li)
+        return False
 
     def refresh_visible(self):
         for li in list(self.live):
@@ -549,6 +582,7 @@ class Win(Adw.ApplicationWindow):
             self.info_timer = 0
         self.cur = sel[0] if sel else None
         if not sel:
+            self.shot_message("Select a package to see its screenshot.")
             for tv in self.tab_views:
                 tv.get_buffer().set_text("Select a package to see its details.")
             return
@@ -566,6 +600,9 @@ class Win(Adw.ApplicationWindow):
             self.load_tab(self.cur, self.info_token, num)
 
     def load_tab(self, p, token, idx):
+        if idx == SHOT_TAB:
+            self.load_screenshot(p, token)
+            return
         key = (p.spec, p.installed, idx)
         buf = self.tab_views[idx].get_buffer()
         if key in self.detail_cache:
@@ -589,6 +626,86 @@ class Win(Adw.ApplicationWindow):
         if token == self.info_token and self.cur is not None:
             self.show_text(idx, self.cur, text)
         return False
+
+    def build_shot_tab(self):
+        self.shot_label = Gtk.Label(wrap=True, justify=Gtk.Justification.CENTER, css_classes=["dim-label"])
+        note = Gtk.Box(halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER)
+        note.append(self.shot_label)
+        self.shot_strip = Gtk.Box(spacing=12, margin_top=8, margin_bottom=8, margin_start=12,
+                                  margin_end=12)
+        self.shot_stack = Gtk.Stack()
+        self.shot_stack.add_named(note, "note")
+        self.shot_stack.add_named(Gtk.ScrolledWindow(vexpand=True, min_content_height=170,
+                                                     vscrollbar_policy=Gtk.PolicyType.NEVER,
+                                                     child=self.shot_strip), "strip")
+        return self.shot_stack
+
+    def shot_message(self, text):
+        self.shot_label.set_label(text)
+        self.shot_stack.set_visible_child_name("note")
+
+    def load_screenshot(self, p, token):
+        self.shot_message("Loading\u2026")
+
+        def work():
+            appstream_apps()
+            GLib.idle_add(self.show_shots, token, appstream_screenshots(p.name))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def show_shots(self, token, shots):
+        if token != self.info_token:
+            return False
+        if not shots:
+            self.shot_message("No screenshot is listed for this package.")
+            return False
+        while child := self.shot_strip.get_first_child():
+            self.shot_strip.remove(child)
+        slots = []
+        for caption, url in shots:
+            slot = Gtk.Button(halign=Gtk.Align.START, valign=Gtk.Align.START, css_classes=["flat"],
+                              tooltip_text=caption or None)
+            slot.set_child(Gtk.Spinner(spinning=True, width_request=SHOT_HEIGHT * 16 // 9,
+                                       height_request=SHOT_HEIGHT))
+            self.shot_strip.append(slot)
+            slots.append((slot, caption, url))
+        self.shot_stack.set_visible_child_name("strip")
+        threading.Thread(target=self._shot_work, args=(token, slots), daemon=True).start()
+        return False
+
+    def _shot_work(self, token, slots):
+        for slot, caption, url in slots:
+            if token != self.info_token:
+                return
+            GLib.idle_add(self.shot_ready, token, slot, caption, fetch_screenshot(url))
+
+    def shot_ready(self, token, slot, caption, path):
+        if token != self.info_token:
+            return False
+        tex = texture_from(path) if path else None
+        if tex is None:
+            slot.set_child(Gtk.Image(icon_name="image-missing-symbolic", pixel_size=48,
+                                     width_request=SHOT_HEIGHT * 16 // 9, height_request=SHOT_HEIGHT,
+                                     tooltip_text="Could not load this screenshot"))
+            slot.set_sensitive(False)
+            return False
+        pic = Gtk.Picture(paintable=tex, content_fit=Gtk.ContentFit.CONTAIN, can_shrink=True)
+        pic.set_size_request(max(1, round(tex.get_width() * SHOT_HEIGHT / tex.get_height())), SHOT_HEIGHT)
+        slot.set_child(pic)
+        slot.connect("clicked", lambda *_: self.open_shot(tex, caption))
+        return False
+
+    def open_shot(self, tex, caption):
+        name = self.cur.name if self.cur else "Screenshot"
+        dlg = Adw.Dialog(title=f"{name}: {caption}" if caption else name,
+                         content_width=min(tex.get_width(), 1100),
+                         content_height=min(tex.get_height() + 48, 800))
+        body = Adw.ToolbarView()
+        body.add_top_bar(Adw.HeaderBar())
+        body.set_content(Gtk.Picture(paintable=tex, content_fit=Gtk.ContentFit.CONTAIN,
+                                     can_shrink=True))
+        dlg.set_child(body)
+        dlg.present(self)
 
     def show_text(self, idx, p, text):
         buf = self.tab_views[idx].get_buffer()

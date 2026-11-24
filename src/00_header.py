@@ -18,6 +18,8 @@ get one polkit prompt per transaction. Pins use `dnf5 versionlock`
 (state in /etc/dnf/versionlock.toml).
 """
 import gzip
+import hashlib
+import ipaddress
 import json
 import operator
 import os
@@ -25,10 +27,16 @@ import pwd
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
+import tempfile
 import threading
+import time
 import tomllib
+import urllib.error
+import urllib.parse
+import urllib.request
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 
@@ -36,4 +44,5 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango  # noqa: E402
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import Adw, Gdk, GdkPixbuf, Gio, GLib, GObject, Gtk, Pango  # noqa: E402

@@ -58,8 +58,7 @@ def detail_text(p, idx):
     if idx == 0:
         info = dnf5("info", p.spec) or "No information available."
         app = appstream_text(p.name)
-        rule = "\u2500" * 40
-        return f"{app}\n\n{rule}\n\n{info}" if app else info
+        return f"{app}\n\n{INFO_RULE}\n\n{info}" if app else info
     if idx == 1:
         with ThreadPoolExecutor(max_workers=3) as ex:
             f_req = ex.submit(dnf5, "repoquery", *scope, "--requires", p.spec)

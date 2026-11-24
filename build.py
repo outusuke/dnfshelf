@@ -19,7 +19,7 @@ LAYERS = [
     ("25_launcher.py", "copy this file to ~/.local/bin, app-menu entry"),
     ("30_system.py", "pins, automatic.conf editing, systemd guard and notify units, "
                      "GameMode, GNOME Software"),
-    ("35_appstream.py", "AppStream catalog: package name to app metadata and icon, read from local files"),
+    ("35_appstream.py", "AppStream catalog: package name to app metadata and icon, read from local files; optional screenshot fetch"),
     ("40_data.py", "package list assembly, details text, package cache file, "
                    "history and repo parsers"),
     ("50_model.py", "queue actions, Pkg, PkgModel"),

@@ -26,6 +26,14 @@ def action_valid(p, action):
     }[action]
 
 
+def pkg_icon(p):
+    if _apps is None:  # catalog still loading: don't cache a miss
+        return None
+    if p.icon is None:
+        p.icon = appstream_icon(p.name, ("64x64", "128x128"))
+    return texture_from(p.icon) if p.icon else None
+
+
 class Pkg(GObject.Object):
     """Plain Python attributes on purpose: GObject properties cost a C<->Python round
     trip per access, which is painful with tens of thousands of packages."""
@@ -38,6 +46,7 @@ class Pkg(GObject.Object):
         self.upgradable = bool(upg)
         self.pinned = pinned
         self.actions = set()
+        self.icon = None  # "" means none, None means not looked up yet
         self.version = self.inst or self.latest
         self.hay = f"{self.name} {self.summary}".lower()
         self.status = self.queued = ""

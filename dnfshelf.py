@@ -18,6 +18,8 @@ get one polkit prompt per transaction. Pins use `dnf5 versionlock`
 (state in /etc/dnf/versionlock.toml).
 """
 import gzip
+import hashlib
+import ipaddress
 import json
 import operator
 import os
@@ -25,10 +27,16 @@ import pwd
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
+import tempfile
 import threading
+import time
 import tomllib
+import urllib.error
+import urllib.parse
+import urllib.request
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 
@@ -36,7 +44,8 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango  # noqa: E402
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import Adw, Gdk, GdkPixbuf, Gio, GLib, GObject, Gtk, Pango  # noqa: E402
 
 
 APP_ID = "org.outusuke.Dnfshelf"
@@ -85,6 +94,10 @@ QF = r"%{name}|%{evr}|%{arch}|%{repoid}|%{summary}\n"
 USE_CACHEONLY = True
 CACHE_DIR = os.path.join(GLib.get_user_cache_dir(), "dnfshelf")
 CACHE_FILE = os.path.join(CACHE_DIR, "packages.json")
+SHOT_TAB = 4
+SHOT_HEIGHT = 160
+ICON_PX = 28
+INFO_RULE = "\u2500" * 40
 PKG_QF = r"%{name}\n"
 SO_CAP = re.compile(r"^([^()\s]+\.so[^()\s]*)\(.*\)$")
 COMPS_RE = re.compile(r"^(\S+)\s+(.+?)\s+(yes|no)\s*$")
@@ -503,11 +516,21 @@ def set_gs_paused(on):
 
 APPSTREAM_DIRS = ("/usr/share/swcatalog", "/var/cache/swcatalog")
 APPSTREAM_CACHE = os.path.join(CACHE_DIR, "appstream.json")
-APPSTREAM_FORMAT = 2  # bump when the parsed fields change
+APPSTREAM_FORMAT = 4  # bump when the parsed fields change
 # Pre-0.16 catalogs name desktop apps just "desktop".
 APP_TYPES = ("desktop-application", "console-application", "desktop")
 XML_LANG = "{http://www.w3.org/XML/1998/namespace}lang"
+SHOT_DIR = os.path.join(CACHE_DIR, "screenshots")
+SHOT_MAX_BYTES = 5 * 1024 * 1024
+SHOT_MAX_PIXELS = 16_000_000
+SHOT_MAX_WIDTH = 640
+SHOT_TIMEOUT = 10
+SHOT_DEADLINE = 20
+SHOT_KEEP = 200
+SHOT_LIMIT = 8
 _apps, _apps_lock = None, threading.Lock()
+_shot_failed = set()
+_textures = {}
 
 
 def ui_languages():
@@ -559,6 +582,20 @@ def _safe_name(s):
     return bool(s) and os.path.basename(s) == s and s not in (".", "..")
 
 
+def _screenshots(comp, langs):
+    shots = comp.findall("screenshots/screenshot")
+    shots.sort(key=lambda s: s.get("type") != "default")
+    out = []
+    for shot in shots:
+        for img in shot.findall("image"):
+            url = (img.text or "").strip()
+            if img.get("type", "source") == "source" and url.startswith("https://") and len(url) <= 2048:
+                cap = _localized(shot, "caption", langs)
+                out.append([_flat(cap) if cap is not None else "", url])
+                break
+    return out[:SHOT_LIMIT]
+
+
 def parse_appstream(stream, langs):
     """{package name: metadata} from one AppStream catalog file."""
     out, origin = {}, ""
@@ -577,7 +614,8 @@ def parse_appstream(stream, langs):
                         "homepage": next((u.text or "" for u in el.findall("url")
                                           if u.get("type") == "homepage"), ""),
                         "categories": [c.text for c in el.findall("categories/category") if c.text],
-                        "icon": [origin, icon] if _safe_name(origin) and _safe_name(icon) else []}
+                        "icon": [origin, icon] if _safe_name(origin) and _safe_name(icon) else [],
+                        "screenshots": _screenshots(el, langs)}
                 for pkg in el.findall("pkgname"):
                     if pkg.text:
                         out.setdefault(pkg.text, meta)
@@ -645,17 +683,134 @@ def appstream_text(name):
     return "\n\n".join(x for x in (head, meta["description"], facts) if x)
 
 
-def appstream_icon(name):
+def appstream_icon(name, sizes=("128x128", "64x64")):
     """Icon file for a package, only if the catalog is already loaded (never blocks the UI)."""
     meta = (_apps or {}).get(name)
     if not meta or not meta["icon"]:
         return ""
     origin, filename = meta["icon"]
     for base in APPSTREAM_DIRS:
-        for size in ("128x128", "64x64"):
+        for size in sizes:
             path = os.path.join(base, "icons", origin, size, filename)
             if os.path.isfile(path):
                 return path
+    return ""
+
+
+def appstream_screenshots(name):
+    meta = (_apps or {}).get(name)
+    return meta["screenshots"] if meta else []
+
+
+def texture_from(path):
+    if path not in _textures:
+        if len(_textures) > 600:
+            _textures.clear()
+        try:
+            _textures[path] = Gdk.Texture.new_from_filename(path)
+        except GLib.Error:
+            _textures[path] = None
+    return _textures[path]
+
+
+def screenshot_path(url):
+    return os.path.join(SHOT_DIR, hashlib.sha256(url.encode()).hexdigest() + ".png")
+
+
+def _public_host(host, port):
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        addrs = [ipaddress.ip_address(i[4][0].split("%")[0]) for i in infos]
+    except (OSError, ValueError):
+        return False
+    return bool(addrs) and all((getattr(a, "ipv4_mapped", None) or a).is_global for a in addrs)
+
+
+def screenshot_url_ok(url):
+    """Catalog URLs are untrusted: public https hosts only."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        port = parts.port or 443
+    except ValueError:
+        return False
+    return (parts.scheme == "https" and len(url) <= 2048 and bool(parts.hostname)
+            and not (parts.username or parts.password) and _public_host(parts.hostname, port))
+
+
+class _HttpsOnly(urllib.request.HTTPRedirectHandler):
+    max_redirections = 3
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not screenshot_url_ok(urllib.parse.urljoin(req.full_url, newurl)):
+            raise urllib.error.URLError("redirect refused")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _download(url, dest):
+    req = urllib.request.Request(url, headers={"User-Agent": "Dnfshelf", "Accept": "image/png, image/jpeg"})
+    end = time.monotonic() + SHOT_DEADLINE
+    size = 0
+    with urllib.request.build_opener(_HttpsOnly).open(req, timeout=SHOT_TIMEOUT) as resp, \
+            open(dest, "wb") as out:
+        if int(resp.headers.get("Content-Length") or 0) > SHOT_MAX_BYTES:
+            return False
+        while chunk := resp.read(65536):
+            size += len(chunk)
+            if size > SHOT_MAX_BYTES or time.monotonic() > end:
+                return False
+            out.write(chunk)
+    return size > 0
+
+
+def _normalize_image(src, dest):
+    # Header first: a tiny file can declare a huge image.
+    fmt, width, height = GdkPixbuf.Pixbuf.get_file_info(src)
+    if fmt is None or fmt.get_name() not in ("png", "jpeg") or width < 1 or height < 1 \
+            or width * height > SHOT_MAX_PIXELS:
+        return False
+    pix = GdkPixbuf.Pixbuf.new_from_file_at_scale(src, min(width, SHOT_MAX_WIDTH), -1, True)
+    return pix.savev(dest, "png", [], [])
+
+
+def _remove(*paths):
+    for path in paths:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def prune_screenshots():
+    try:
+        files = sorted((os.path.getmtime(p), p) for p in
+                       (os.path.join(SHOT_DIR, n) for n in os.listdir(SHOT_DIR) if n.endswith(".png")))
+    except OSError:
+        return
+    _remove(*(p for _, p in files[:-SHOT_KEEP]))
+
+
+def fetch_screenshot(url):
+    """Cached PNG path for a screenshot URL, or "" on any failure."""
+    path = screenshot_path(url)
+    if os.path.isfile(path):
+        return path
+    if url in _shot_failed or not screenshot_url_ok(url):
+        return ""
+    raw = tmp = ""
+    try:
+        os.makedirs(SHOT_DIR, exist_ok=True)
+        fd, raw = tempfile.mkstemp(dir=SHOT_DIR, suffix=".dl")
+        os.close(fd)
+        tmp = raw + ".png"
+        if _download(url, raw) and _normalize_image(raw, tmp):
+            os.replace(tmp, path)
+            prune_screenshots()
+            return path
+    except Exception:
+        pass
+    finally:
+        _remove(raw, tmp)
+    _shot_failed.add(url)
     return ""
 
 
@@ -719,8 +874,7 @@ def detail_text(p, idx):
     if idx == 0:
         info = dnf5("info", p.spec) or "No information available."
         app = appstream_text(p.name)
-        rule = "\u2500" * 40
-        return f"{app}\n\n{rule}\n\n{info}" if app else info
+        return f"{app}\n\n{INFO_RULE}\n\n{info}" if app else info
     if idx == 1:
         with ThreadPoolExecutor(max_workers=3) as ex:
             f_req = ex.submit(dnf5, "repoquery", *scope, "--requires", p.spec)
@@ -852,6 +1006,14 @@ def action_valid(p, action):
     }[action]
 
 
+def pkg_icon(p):
+    if _apps is None:  # catalog still loading: don't cache a miss
+        return None
+    if p.icon is None:
+        p.icon = appstream_icon(p.name, ("64x64", "128x128"))
+    return texture_from(p.icon) if p.icon else None
+
+
 class Pkg(GObject.Object):
     """Plain Python attributes on purpose: GObject properties cost a C<->Python round
     trip per access, which is painful with tens of thousands of packages."""
@@ -864,6 +1026,7 @@ class Pkg(GObject.Object):
         self.upgradable = bool(upg)
         self.pinned = pinned
         self.actions = set()
+        self.icon = None  # "" means none, None means not looked up yet
         self.version = self.inst or self.latest
         self.hay = f"{self.name} {self.summary}".lower()
         self.status = self.queued = ""
@@ -1639,6 +1802,7 @@ class Win(Adw.ApplicationWindow):
         self.info_timer = 0
         self.gen = 0           # load generation, so stale loads are ignored
         self.live = set()      # currently bound Status/Queued cells
+        self.icon_cells = set()  # currently bound Name cells
         self.sort_prop, self.sort_desc = "name", False
         self.col_props = {}
         self.cur = None        # package shown in the details pane
@@ -1678,7 +1842,7 @@ class Win(Adw.ApplicationWindow):
         self.view = Gtk.ColumnView(show_row_separators=True)
         self.add_col("Status", "status", width=120)
         self.add_col("Queued", "queued", width=110)
-        name_col = self.add_col("Name", "name", width=260)
+        name_col = self.add_col("Name", "name", width=260, icon=True)
         self.add_col("Version", "version", width=190)
         self.add_col("Latest", "latest", width=190)
         self.add_col("Repo", "repo", width=130)
@@ -1717,6 +1881,7 @@ class Win(Adw.ApplicationWindow):
             self.notebook.append_page(
                 Gtk.ScrolledWindow(vexpand=True, min_content_height=170, child=tv),
                 Gtk.Label(label=title))
+        self.notebook.append_page(self.build_shot_tab(), Gtk.Label(label="Screenshots"))
         self.notebook.connect("switch-page", self.on_tab_switch)
         bottom = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         bottom.append(bar)
@@ -1735,10 +1900,11 @@ class Win(Adw.ApplicationWindow):
         self.overlay = Adw.ToastOverlay(child=tb)
         self.set_content(self.overlay)
         self.install_actions()
+        threading.Thread(target=self.load_catalog, daemon=True).start()
         self.view.sort_by_column(name_col, Gtk.SortType.ASCENDING)  # last: needs self.count
 
     # ---- UI helpers
-    def add_col(self, title, prop, width=None, expand=False):
+    def add_col(self, title, prop, width=None, expand=False, icon=False):
         f = Gtk.SignalListItemFactory()
         live = prop in ("status", "queued")  # the only cells that change after load
 
@@ -1749,13 +1915,23 @@ class Win(Adw.ApplicationWindow):
             click = Gtk.GestureClick(button=3)
             click.connect("pressed", lambda g, n, x, y, li=li, w=lbl: self.context_menu(li, w, x, y))
             lbl.add_controller(click)
-            li.set_child(lbl)
+            if not icon:
+                li.set_child(lbl)
+                return
+            box = Gtk.Box(spacing=4, margin_start=4)
+            box.append(Gtk.Image(pixel_size=ICON_PX))
+            box.append(lbl)
+            li.set_child(box)
 
         def bind(_f, li):
             text = getattr(li.get_item(), prop)
-            lbl = li.get_child()
+            child = li.get_child()
+            lbl = child.get_last_child() if icon else child
             if lbl.get_label() != text:
                 lbl.set_label(text)
+            if icon:
+                self.icon_cells.add(li)
+                self.bind_icon(li)
             if live:
                 li.prop = prop
                 self.live.add(li)
@@ -1763,6 +1939,8 @@ class Win(Adw.ApplicationWindow):
         def unbind(_f, li):
             if live:
                 self.live.discard(li)
+            if icon:
+                self.icon_cells.discard(li)
 
         f.connect("setup", setup)
         f.connect("bind", bind)
@@ -1774,6 +1952,24 @@ class Win(Adw.ApplicationWindow):
         self.col_props[title] = prop
         self.view.append_column(col)
         return col
+
+    def bind_icon(self, li):
+        img = li.get_child().get_first_child()
+        tex = pkg_icon(li.get_item())
+        if tex:
+            img.set_from_paintable(tex)
+        else:
+            img.set_from_icon_name("package-x-generic-symbolic")
+        img.set_opacity(1.0 if tex else 0.45)
+
+    def load_catalog(self):
+        appstream_apps()
+        GLib.idle_add(self.icons_ready)
+
+    def icons_ready(self):
+        for li in list(self.icon_cells):
+            self.bind_icon(li)
+        return False
 
     def refresh_visible(self):
         for li in list(self.live):
@@ -2178,6 +2374,7 @@ class Win(Adw.ApplicationWindow):
             self.info_timer = 0
         self.cur = sel[0] if sel else None
         if not sel:
+            self.shot_message("Select a package to see its screenshot.")
             for tv in self.tab_views:
                 tv.get_buffer().set_text("Select a package to see its details.")
             return
@@ -2195,6 +2392,9 @@ class Win(Adw.ApplicationWindow):
             self.load_tab(self.cur, self.info_token, num)
 
     def load_tab(self, p, token, idx):
+        if idx == SHOT_TAB:
+            self.load_screenshot(p, token)
+            return
         key = (p.spec, p.installed, idx)
         buf = self.tab_views[idx].get_buffer()
         if key in self.detail_cache:
@@ -2218,6 +2418,86 @@ class Win(Adw.ApplicationWindow):
         if token == self.info_token and self.cur is not None:
             self.show_text(idx, self.cur, text)
         return False
+
+    def build_shot_tab(self):
+        self.shot_label = Gtk.Label(wrap=True, justify=Gtk.Justification.CENTER, css_classes=["dim-label"])
+        note = Gtk.Box(halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER)
+        note.append(self.shot_label)
+        self.shot_strip = Gtk.Box(spacing=12, margin_top=8, margin_bottom=8, margin_start=12,
+                                  margin_end=12)
+        self.shot_stack = Gtk.Stack()
+        self.shot_stack.add_named(note, "note")
+        self.shot_stack.add_named(Gtk.ScrolledWindow(vexpand=True, min_content_height=170,
+                                                     vscrollbar_policy=Gtk.PolicyType.NEVER,
+                                                     child=self.shot_strip), "strip")
+        return self.shot_stack
+
+    def shot_message(self, text):
+        self.shot_label.set_label(text)
+        self.shot_stack.set_visible_child_name("note")
+
+    def load_screenshot(self, p, token):
+        self.shot_message("Loading\u2026")
+
+        def work():
+            appstream_apps()
+            GLib.idle_add(self.show_shots, token, appstream_screenshots(p.name))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def show_shots(self, token, shots):
+        if token != self.info_token:
+            return False
+        if not shots:
+            self.shot_message("No screenshot is listed for this package.")
+            return False
+        while child := self.shot_strip.get_first_child():
+            self.shot_strip.remove(child)
+        slots = []
+        for caption, url in shots:
+            slot = Gtk.Button(halign=Gtk.Align.START, valign=Gtk.Align.START, css_classes=["flat"],
+                              tooltip_text=caption or None)
+            slot.set_child(Gtk.Spinner(spinning=True, width_request=SHOT_HEIGHT * 16 // 9,
+                                       height_request=SHOT_HEIGHT))
+            self.shot_strip.append(slot)
+            slots.append((slot, caption, url))
+        self.shot_stack.set_visible_child_name("strip")
+        threading.Thread(target=self._shot_work, args=(token, slots), daemon=True).start()
+        return False
+
+    def _shot_work(self, token, slots):
+        for slot, caption, url in slots:
+            if token != self.info_token:
+                return
+            GLib.idle_add(self.shot_ready, token, slot, caption, fetch_screenshot(url))
+
+    def shot_ready(self, token, slot, caption, path):
+        if token != self.info_token:
+            return False
+        tex = texture_from(path) if path else None
+        if tex is None:
+            slot.set_child(Gtk.Image(icon_name="image-missing-symbolic", pixel_size=48,
+                                     width_request=SHOT_HEIGHT * 16 // 9, height_request=SHOT_HEIGHT,
+                                     tooltip_text="Could not load this screenshot"))
+            slot.set_sensitive(False)
+            return False
+        pic = Gtk.Picture(paintable=tex, content_fit=Gtk.ContentFit.CONTAIN, can_shrink=True)
+        pic.set_size_request(max(1, round(tex.get_width() * SHOT_HEIGHT / tex.get_height())), SHOT_HEIGHT)
+        slot.set_child(pic)
+        slot.connect("clicked", lambda *_: self.open_shot(tex, caption))
+        return False
+
+    def open_shot(self, tex, caption):
+        name = self.cur.name if self.cur else "Screenshot"
+        dlg = Adw.Dialog(title=f"{name}: {caption}" if caption else name,
+                         content_width=min(tex.get_width(), 1100),
+                         content_height=min(tex.get_height() + 48, 800))
+        body = Adw.ToolbarView()
+        body.add_top_bar(Adw.HeaderBar())
+        body.set_content(Gtk.Picture(paintable=tex, content_fit=Gtk.ContentFit.CONTAIN,
+                                     can_shrink=True))
+        dlg.set_child(body)
+        dlg.present(self)
 
     def show_text(self, idx, p, text):
         buf = self.tab_views[idx].get_buffer()
