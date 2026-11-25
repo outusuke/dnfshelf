@@ -259,7 +259,8 @@ class Win(Adw.ApplicationWindow):
             return ["pkexec", *cmd], preview, [dry]
 
         argv, preview, dry = build(False)
-        self.run_cmd(title, argv, preview, reload=True, dry=dry, rebuild=build)
+        self.run_cmd(title, argv, preview, reload=True, dry=dry, rebuild=build,
+                     note=note.strip())
 
     def upgrade_all(self):
         self.upgrade_flow("Upgrade all")
@@ -279,10 +280,10 @@ class Win(Adw.ApplicationWindow):
             self.toast(f"Failed: {e}")
 
     def run_cmd(self, title, argv, preview, reload=False, autorun=False, dry=None,
-                rebuild=None):
+                rebuild=None, note=""):
         RunWindow(self, title, argv, preview,
                   on_done=(lambda rc: self.reload()) if reload else None,
-                  autorun=autorun, dry=dry, rebuild=rebuild).present()
+                  autorun=autorun, dry=dry, rebuild=rebuild, note=note).present()
 
     def run_root(self, done, cmds):
         """Short privileged commands, run in the background; `done` is the success toast."""
@@ -817,7 +818,7 @@ class Win(Adw.ApplicationWindow):
             script = " && ".join(shlex.join(c) for c in cmds)
             preview = "Planned commands (run in order, as root):\n\n" + \
                       "\n".join("  " + shlex.join(c) for c in cmds) + \
-                      "\n\nPress Run to execute."
+                      "\n\nPress Apply to execute."
             dry = [[c for c in cmd if c != "-y"] + ["--assumeno"] for cmd in cmds if "-y" in cmd]
             return ["pkexec", "sh", "-c", script], preview, dry
 
@@ -825,10 +826,12 @@ class Win(Adw.ApplicationWindow):
         if not cmds:
             return
         argv, preview, dry = build(False)
+        other = [shlex.join(c) for c in cmds if "-y" not in c]
         # --allowerasing only exists on install/upgrade here, so only offer a retry for those
         can_erase = any(c[2] in ("install", "upgrade") for c in cmds)
         self.run_cmd("Apply changes", argv, preview, reload=True, dry=dry or None,
-                     rebuild=build if can_erase else None)
+                     rebuild=build if can_erase else None,
+                     note="Also runs: " + "; ".join(other) if other else "")
 
     def mark_selected(self, kind, label):
         names = [p.spec for p in self.selected() if p.installed]
