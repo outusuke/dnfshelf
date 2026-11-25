@@ -2262,7 +2262,7 @@ class Win(Adw.ApplicationWindow):
     def toast_details(self, msg, title, out):
         t = Adw.Toast.new(msg)
         t.set_button_label("Details")
-        t.connect("button-clicked", lambda *_: self.show_output(title, out))
+        t.connect("button-clicked", lambda *_: self.show_output(msg, out))
         self.overlay.add_toast(t)
 
     def autoremove(self):
@@ -2382,9 +2382,16 @@ class Win(Adw.ApplicationWindow):
         return False
 
     def show_output(self, title, text):
-        w = RunWindow(self, title, [], text.strip() or "(no output)")
-        w.run_btn.set_visible(False)
-        w.present()
+        text = text.strip() or "(no output)"
+        dlg = Adw.AlertDialog(heading=title, body=text.splitlines()[-1][:200])
+        tv = Gtk.TextView(editable=False, monospace=True, left_margin=8, right_margin=8,
+                          top_margin=8, bottom_margin=8, wrap_mode=Gtk.WrapMode.WORD_CHAR)
+        tv.get_buffer().set_text(text)
+        dlg.set_extra_child(Gtk.ScrolledWindow(child=tv, min_content_height=200,
+                                               min_content_width=420, css_classes=["card"]))
+        dlg.add_response("close", "Close")
+        dlg.set_close_response("close")
+        dlg.present(self)
 
     def _refreshed(self):
         self.toast("Package list refreshed")
