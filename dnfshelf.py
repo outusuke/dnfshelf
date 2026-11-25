@@ -1346,8 +1346,7 @@ class HistoryWindow(Adw.Window):
         super().__init__(transient_for=parent, modal=True, title="Transaction history",
                          default_width=760, default_height=600)
         self.parent_win = parent
-        self.placeholder = Gtk.Label(label="Loading\u2026", css_classes=["dim-label"],
-                                     margin_top=48, margin_bottom=48)
+        self.placeholder = Adw.StatusPage(title="Loading\u2026", css_classes=["compact"])
         self.box = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE,
                                css_classes=["boxed-list"], margin_top=12, margin_bottom=12,
                                margin_start=12, margin_end=12, valign=Gtk.Align.START)
@@ -1371,8 +1370,8 @@ class HistoryWindow(Adw.Window):
             self._set_empty_text()
 
     def _set_empty_text(self):
-        self.placeholder.set_text("No automatic runs found" if self.only_auto.get_active()
-                                  else "No transactions found")
+        self.placeholder.set_title("No automatic runs found" if self.only_auto.get_active()
+                                   else "No transactions found")
 
     def _load(self):
         items = parse_history(run(["dnf5", "history", "list"]))
@@ -1452,8 +1451,7 @@ class PinsWindow(Adw.Window):
             box.append(row)
         body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         if not entries:
-            body.append(Gtk.Label(label="No pinned packages", css_classes=["dim-label"],
-                                  margin_top=48))
+            body.append(Adw.StatusPage(title="No pinned packages", css_classes=["compact"]))
         body.append(box)
         tb = Adw.ToolbarView()
         tb.add_top_bar(hb)
@@ -1686,8 +1684,8 @@ class CompsPage(Gtk.Box):
         self.listbox = Gtk.ListBox(selection_mode=Gtk.SelectionMode.SINGLE,
                                    css_classes=["boxed-list"], valign=Gtk.Align.START)
         self.listbox.set_filter_func(self._match)
-        self.listbox.set_placeholder(Gtk.Label(label="Loading\u2026", css_classes=["dim-label"],
-                                               margin_top=24, margin_bottom=24))
+        self.listbox.set_placeholder(Adw.StatusPage(title="Loading\u2026",
+                                                    css_classes=["compact"]))
         self.listbox.connect("row-selected", self.on_select)
         self.info = Gtk.TextView(editable=False, monospace=True, left_margin=8, top_margin=8,
                                  bottom_margin=8, wrap_mode=Gtk.WrapMode.WORD_CHAR)
@@ -1740,8 +1738,8 @@ class CompsPage(Gtk.Box):
                 row.add_prefix(Gtk.Image.new_from_icon_name("object-select-symbolic"))
             self.row_ids[row] = gid
             self.listbox.append(row)
-        self.listbox.set_placeholder(Gtk.Label(
-            label="Nothing to show", css_classes=["dim-label"], margin_top=24, margin_bottom=24))
+        self.listbox.set_placeholder(Adw.StatusPage(title="Nothing to show",
+                                                    css_classes=["compact"]))
         self.update_buttons()
         return False
 
@@ -2022,7 +2020,8 @@ class Win(Adw.ApplicationWindow):
         self.view.get_sorter().connect("changed", self.on_sort_changed)
 
         # bottom: actions + info
-        bar = Gtk.Box(spacing=6, margin_top=6, margin_bottom=6, margin_start=6, margin_end=6)
+        bar = Gtk.Box(spacing=6, margin_top=6, margin_bottom=6, margin_start=6, margin_end=6,
+                      css_classes=["toolbar"])
         bar.set_size_request(-1, 48)
         self.hint = Gtk.Label(label="Select packages to see available actions",
                               css_classes=["dim-label"])
@@ -2054,8 +2053,12 @@ class Win(Adw.ApplicationWindow):
         bottom.append(bar)
         bottom.append(self.notebook)
 
+        self.empty = Adw.StatusPage(icon_name="edit-find-symbolic")
+        self.list_stack = Gtk.Stack(vexpand=True)
+        self.list_stack.add_named(Gtk.ScrolledWindow(child=self.view), "list")
+        self.list_stack.add_named(self.empty, "empty")
         paned = Gtk.Paned(orientation=Gtk.Orientation.VERTICAL, position=480,
-                          start_child=Gtk.ScrolledWindow(vexpand=True, child=self.view),
+                          start_child=self.list_stack,
                           end_child=bottom, shrink_start_child=False, shrink_end_child=False)
 
         tb = Adw.ToolbarView()
@@ -2411,6 +2414,7 @@ class Win(Adw.ApplicationWindow):
         self.refilter()
         if final:
             self.loading_main = False
+            self.sync_empty()
             self.spin.stop()
             self._run_after_load()
         return False
@@ -2419,6 +2423,7 @@ class Win(Adw.ApplicationWindow):
         if gen is not None and gen != self.gen:
             return False
         self.loading_main = False
+        self.sync_empty()
         self.after_load = None
         self.spin.stop()
         self.toast(f"Failed to load packages: {msg}")
@@ -2463,9 +2468,30 @@ class Win(Adw.ApplicationWindow):
             rows = list(rows)
         self.model.set_rows(rows)
         loading = mode in SET_QUERIES and mode not in self.sets
-        text = f"{len(rows)} packages" + (f" \u00b7 {self.n_upg} upgradable" if self.n_upg else "")
+        text = f"{len(rows)} package{'' if len(rows) == 1 else 's'}" + (f" \u00b7 {self.n_upg} upgradable" if self.n_upg else "")
         self.count.set_text(("Checking security advisories\u2026" if mode == M_SECURITY
                              else "Loading\u2026") if loading else text)
+        self.sync_empty()
+
+    def sync_empty(self):
+        """Swap the table for a status page while it has nothing to show."""
+        loading = self.loading_main or self.mode.get_selected() in self.set_loading
+        if self.model.get_n_items():
+            self.list_stack.set_visible_child_name("list")
+            return
+        if loading:
+            self.empty.set_icon_name("content-loading-symbolic")
+            self.empty.set_title("Loading packages\u2026")
+            self.empty.set_description("")
+        elif self.query:
+            self.empty.set_icon_name("edit-find-symbolic")
+            self.empty.set_title("No results")
+            self.empty.set_description("Try a different search or filter.")
+        else:
+            self.empty.set_icon_name("package-x-generic-symbolic")
+            self.empty.set_title("No packages")
+            self.empty.set_description("Nothing matches this filter.")
+        self.list_stack.set_visible_child_name("empty")
 
     def on_search_mode(self, act, value):
         act.set_state(value)
