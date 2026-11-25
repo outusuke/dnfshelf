@@ -122,7 +122,7 @@ class RunWindow(Adw.Window):
             tooltip_text="Run the dry run again with --allowerasing. "
                          "Nothing is removed until you press Apply.")
         self.retry_btn.connect("clicked", lambda *_: self.retry())
-        hb = Adw.HeaderBar(show_start_title_buttons=False, show_end_title_buttons=False)
+        self.header = hb = Adw.HeaderBar(show_start_title_buttons=False, show_end_title_buttons=False)
         hb.pack_start(self.close_btn)
         hb.pack_end(self.run_btn)
         hb.pack_end(self.details_btn)

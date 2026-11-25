@@ -70,6 +70,11 @@ class HistoryWindow(Adw.Window):
                       busy="Loading transaction\u2026")
         w.close_btn.set_label("Close")
         w.run_btn.set_visible(False)
+        for label, tip, fn in (("Undo", "Undo this transaction", self.undo),
+                               ("Roll back", "Roll back to the state after this one", self.rollback)):
+            b = Gtk.Button(label=label, tooltip_text=tip)
+            b.connect("clicked", lambda _b, f=fn: (w.close(), f(tid)))
+            w.header.pack_end(b)
         w.present()
 
     def _transact(self, verb, tid):
