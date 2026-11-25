@@ -104,9 +104,12 @@ class Win(Adw.ApplicationWindow):
             tv = Gtk.TextView(editable=False, monospace=True, left_margin=8, top_margin=8,
                               wrap_mode=Gtk.WrapMode.WORD_CHAR)
             self.tab_views.append(tv)
-            self.notebook.append_page(
-                Gtk.ScrolledWindow(vexpand=True, min_content_height=170, child=tv),
-                Gtk.Label(label=title))
+            page = Gtk.ScrolledWindow(vexpand=True, min_content_height=170, child=tv)
+            if title == "Info":
+                self.info_stack = Gtk.Stack()
+                self.info_stack.add_named(page, "text")
+                page = self.info_stack
+            self.notebook.append_page(page, Gtk.Label(label=title))
         self.notebook.append_page(self.build_shot_tab(), Gtk.Label(label="Screenshots"))
         self.notebook.connect("switch-page", self.on_tab_switch)
         bottom = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -655,6 +658,7 @@ class Win(Adw.ApplicationWindow):
             self.shot_message("Select a package to see its screenshot.")
             for tv in self.tab_views:
                 tv.get_buffer().set_text("Select a package to see its details.")
+            self.info_stack.set_visible_child_name("text")
             return
         # Debounce: holding an arrow key would otherwise spawn one dnf5 process per row.
         self.info_timer = GLib.timeout_add(250, self._start_info, self.cur, self.info_token)
@@ -679,6 +683,8 @@ class Win(Adw.ApplicationWindow):
             self.show_text(idx, p, self.detail_cache[key])
             return
         buf.set_text("Loading\u2026")
+        if idx == 0:
+            self.info_stack.set_visible_child_name("text")
 
         def work():
             try:
@@ -777,7 +783,43 @@ class Win(Adw.ApplicationWindow):
         dlg.set_child(body)
         dlg.present(self)
 
+    def show_info_rows(self, p, intro, rows):
+        icon = appstream_icon(p.name)
+        facts = dict(rows)
+        if facts.get("Release"):
+            facts["Version"] = f"{facts.get('Version', '')}-{facts['Release']}"
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, margin_top=12,
+                      margin_bottom=12, margin_start=12, margin_end=12)
+        if intro or icon:
+            head = Gtk.Box(spacing=12)
+            if icon:
+                head.append(Gtk.Image(file=icon, pixel_size=64, valign=Gtk.Align.START))
+            head.append(Gtk.Label(label=intro, wrap=True, xalign=0, hexpand=True, selectable=True,
+                                  valign=Gtk.Align.START))
+            box.append(head)
+        grid = Gtk.Grid(column_spacing=16, row_spacing=4)
+        skip = {"Description", "Release"} | ({"Epoch"} if facts.get("Epoch") == "0" else set())
+        for n, (key, _) in enumerate(k for k in rows if k[0] not in skip):
+            grid.attach(Gtk.Label(label=key, xalign=1, yalign=0, css_classes=["dim-label"]), 0, n, 1, 1)
+            grid.attach(Gtk.Label(label=facts[key], xalign=0, yalign=0, hexpand=True, wrap=True,
+                                  selectable=True), 1, n, 1, 1)
+        box.append(grid)
+        if facts.get("Description"):
+            box.append(Gtk.Label(label=facts["Description"], wrap=True, xalign=0, selectable=True))
+        page = Gtk.ScrolledWindow(child=Adw.Clamp(maximum_size=900, child=box))
+        old = self.info_stack.get_child_by_name("rows")
+        if old:
+            self.info_stack.remove(old)
+        self.info_stack.add_named(page, "rows")
+        self.info_stack.set_visible_child_name("rows")
+
     def show_text(self, idx, p, text):
+        if idx == 0:
+            info = parse_info(text)
+            if info:
+                self.show_info_rows(p, *info)
+                return
+            self.info_stack.set_visible_child_name("text")
         buf = self.tab_views[idx].get_buffer()
         buf.set_text(text)
         icon = appstream_icon(p.name) if idx == 0 else ""

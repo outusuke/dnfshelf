@@ -50,6 +50,27 @@ def changelog_text(p):
     return "No changelog available."
 
 
+INFO_KEY = re.compile(r"^(\S[^:\n]*?)\s*:\s?(.*)$")
+INFO_MORE = re.compile(r"^\s+:\s?(.*)$")
+
+
+def parse_info(text):
+    """Split Info tab text into (appstream intro, [[key, value]]); None if it is not key/value text."""
+    intro, _, body = text.partition(INFO_RULE)
+    if not body:
+        intro, body = "", text
+    rows = []
+    for line in body.splitlines():
+        m = INFO_MORE.match(line)
+        if m and rows:
+            rows[-1][1] += "\n" + m[1]
+            continue
+        m = INFO_KEY.match(line)
+        if m:
+            rows.append([m[1], m[2]])
+    return (intro.strip(), rows) if len(rows) >= 3 else None
+
+
 def detail_text(p, idx):
     """Text for one tab of the details pane (0 info, 1 dependencies, 2 files, 3 changelog)."""
     if idx == 3:
