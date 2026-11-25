@@ -867,6 +867,36 @@ def changelog_text(p):
     return "No changelog available."
 
 
+SECTION_HEAD = re.compile(r"^.+ \(\d+\):$")
+
+
+def parse_deps(text):
+    sections = []
+    for line in text.splitlines():
+        if SECTION_HEAD.match(line):
+            sections.append((line[:-1], []))
+        elif sections and line.startswith("  "):
+            sections[-1][1].append(line.strip())
+    return sections or None
+
+
+def parse_files(text):
+    lines = text.splitlines()
+    return lines if lines and lines[0].startswith("/") else None
+
+
+def parse_changelog(text):
+    heading, entries = "", []
+    for line in text.splitlines():
+        if line.startswith("Changelogs for"):
+            heading = line
+        elif line.startswith("* "):
+            entries.append((line[2:].strip(), []))
+        elif entries and line.strip():
+            entries[-1][1].append(line.strip())
+    return (heading, entries) if entries else None  # None: unknown layout, show the raw text
+
+
 INFO_KEY = re.compile(r"^(\S[^:\n]*?)\s*:\s?(.*)$")
 INFO_MORE = re.compile(r"^\s+:\s?(.*)$")
 
@@ -2105,18 +2135,17 @@ class Win(Adw.ApplicationWindow):
         self.count = Gtk.Label(label="", hexpand=True, xalign=1)
         bar.append(self.count)
 
-        self.tab_views = []
+        self.tab_views, self.tab_stacks = [], []
         self.notebook = Gtk.Notebook(vexpand=True)
         for title in ("Info", "Dependencies", "Files", "Changelog"):
             tv = Gtk.TextView(editable=False, monospace=True, left_margin=8, top_margin=8,
                               wrap_mode=Gtk.WrapMode.WORD_CHAR)
             self.tab_views.append(tv)
-            page = Gtk.ScrolledWindow(vexpand=True, min_content_height=170, child=tv)
-            if title == "Info":
-                self.info_stack = Gtk.Stack()
-                self.info_stack.add_named(page, "text")
-                page = self.info_stack
-            self.notebook.append_page(page, Gtk.Label(label=title))
+            stack = Gtk.Stack()
+            stack.add_named(Gtk.ScrolledWindow(vexpand=True, min_content_height=170, child=tv), "text")
+            self.tab_stacks.append(stack)
+            self.notebook.append_page(stack, Gtk.Label(label=title))
+        self.info_stack = self.tab_stacks[0]
         self.notebook.append_page(self.build_shot_tab(), Gtk.Label(label="Screenshots"))
         self.notebook.connect("switch-page", self.on_tab_switch)
         bottom = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -2663,9 +2692,9 @@ class Win(Adw.ApplicationWindow):
         self.cur = sel[0] if sel else None
         if not sel:
             self.shot_message("Select a package to see its screenshot.")
-            for tv in self.tab_views:
+            for tv, stack in zip(self.tab_views, self.tab_stacks):
                 tv.get_buffer().set_text("Select a package to see its details.")
-            self.info_stack.set_visible_child_name("text")
+                stack.set_visible_child_name("text")
             return
         # Debounce: holding an arrow key would otherwise spawn one dnf5 process per row.
         self.info_timer = GLib.timeout_add(250, self._start_info, self.cur, self.info_token)
@@ -2690,8 +2719,7 @@ class Win(Adw.ApplicationWindow):
             self.show_text(idx, p, self.detail_cache[key])
             return
         buf.set_text("Loading\u2026")
-        if idx == 0:
-            self.info_stack.set_visible_child_name("text")
+        self.tab_stacks[idx].set_visible_child_name("text")
 
         def work():
             try:
@@ -2813,12 +2841,43 @@ class Win(Adw.ApplicationWindow):
         box.append(grid)
         if facts.get("Description"):
             box.append(Gtk.Label(label=facts["Description"], wrap=True, xalign=0, selectable=True))
-        page = Gtk.ScrolledWindow(child=Adw.Clamp(maximum_size=900, child=box))
-        old = self.info_stack.get_child_by_name("rows")
+        self.set_rows_page(0, Gtk.ScrolledWindow(child=Adw.Clamp(maximum_size=900, child=box)))
+
+    def set_rows_page(self, idx, page):
+        stack = self.tab_stacks[idx]
+        old = stack.get_child_by_name("rows")
         if old:
-            self.info_stack.remove(old)
-        self.info_stack.add_named(page, "rows")
-        self.info_stack.set_visible_child_name("rows")
+            stack.remove(old)
+        stack.add_named(page, "rows")
+        stack.set_visible_child_name("rows")
+
+    def deps_page(self, sections):
+        page = Adw.PreferencesPage()
+        for title, items in sections:
+            group = Adw.PreferencesGroup(title=title)
+            for item in items:
+                group.add(Adw.ActionRow(title=item, use_markup=False, title_selectable=True))
+            page.add(group)
+        return page
+
+    def files_page(self, lines):
+        factory = Gtk.SignalListItemFactory()
+        factory.connect("setup", lambda _f, it: it.set_child(
+            Gtk.Label(xalign=0, selectable=True, margin_start=8, margin_end=8, css_classes=["monospace"])))
+        factory.connect("bind", lambda _f, it: it.get_child().set_label(it.get_item().get_string()))
+        view = Gtk.ListView(model=Gtk.NoSelection(model=Gtk.StringList.new(lines)), factory=factory)
+        return Gtk.ScrolledWindow(vexpand=True, child=view)
+
+    def changelog_page(self, parsed):
+        heading, entries = parsed
+        group = Adw.PreferencesGroup(title=heading)
+        for head, body in entries:
+            group.add(Adw.ActionRow(title=head, subtitle="\n".join(body), subtitle_lines=0,
+                                    use_markup=False, title_selectable=True,
+                                    subtitle_selectable=True))
+        page = Adw.PreferencesPage()
+        page.add(group)
+        return page
 
     def show_text(self, idx, p, text):
         if idx == 0:
@@ -2826,7 +2885,14 @@ class Win(Adw.ApplicationWindow):
             if info:
                 self.show_info_rows(p, *info)
                 return
-            self.info_stack.set_visible_child_name("text")
+        else:
+            parse, build = {1: (parse_deps, self.deps_page), 2: (parse_files, self.files_page),
+                            3: (parse_changelog, self.changelog_page)}[idx]
+            parsed = parse(text)
+            if parsed:
+                self.set_rows_page(idx, build(parsed))
+                return
+        self.tab_stacks[idx].set_visible_child_name("text")
         buf = self.tab_views[idx].get_buffer()
         buf.set_text(text)
         icon = appstream_icon(p.name) if idx == 0 else ""

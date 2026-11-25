@@ -50,6 +50,36 @@ def changelog_text(p):
     return "No changelog available."
 
 
+SECTION_HEAD = re.compile(r"^.+ \(\d+\):$")
+
+
+def parse_deps(text):
+    sections = []
+    for line in text.splitlines():
+        if SECTION_HEAD.match(line):
+            sections.append((line[:-1], []))
+        elif sections and line.startswith("  "):
+            sections[-1][1].append(line.strip())
+    return sections or None
+
+
+def parse_files(text):
+    lines = text.splitlines()
+    return lines if lines and lines[0].startswith("/") else None
+
+
+def parse_changelog(text):
+    heading, entries = "", []
+    for line in text.splitlines():
+        if line.startswith("Changelogs for"):
+            heading = line
+        elif line.startswith("* "):
+            entries.append((line[2:].strip(), []))
+        elif entries and line.strip():
+            entries[-1][1].append(line.strip())
+    return (heading, entries) if entries else None  # None: unknown layout, show the raw text
+
+
 INFO_KEY = re.compile(r"^(\S[^:\n]*?)\s*:\s?(.*)$")
 INFO_MORE = re.compile(r"^\s+:\s?(.*)$")
 
