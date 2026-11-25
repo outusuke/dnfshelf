@@ -68,7 +68,8 @@ def parse_transaction(text):
         if act == "Replaced":
             continue
         prev = old.get((name, arch)) if act in ("Upgrade", "Downgrade", "Reinstall") else None
-        used.add((name, arch) if prev else None)
+        if prev:
+            used.add((name, arch))
         sections.setdefault(HIST_VERBS.get(act, act), []).append([name, evr, reason, prev or ""])
     for act, name, arch, evr, reason in rows:
         if act == "Replaced" and (name, arch) not in used:
