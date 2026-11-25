@@ -42,6 +42,44 @@ def parse_plan(text):
     return sections, stats
 
 
+HIST_ROW = re.compile(r"^\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s*$")
+NEVRA = re.compile(r"^(.+)-(?:\d+:)?([^-]+-[^-]+)\.([^.]+)$")
+HIST_VERBS = {"Install": "Installed", "Upgrade": "Upgraded", "Downgrade": "Downgraded",
+              "Reinstall": "Reinstalled", "Remove": "Removed"}
+
+
+def parse_transaction(text):
+    """Turn `dnf5 history info` into (sections, stats) like parse_plan; None if no packages."""
+    facts, rows, in_pkgs = {}, [], False
+    for line in text.splitlines():
+        if line.startswith("Packages altered"):
+            in_pkgs = True
+        elif in_pkgs:
+            m = HIST_ROW.match(line)
+            n = NEVRA.match(m[2]) if m else None
+            if m and n and m[1] != "Action":
+                rows.append((m[1], n[1], n[3], n[2], m[3]))
+        elif INFO_KEY.match(line):
+            m = INFO_KEY.match(line)
+            facts[m[1]] = m[2].strip()
+    old = {(name, arch): evr for act, name, arch, evr, _ in rows if act == "Replaced"}
+    sections, used = {}, set()
+    for act, name, arch, evr, reason in rows:
+        if act == "Replaced":
+            continue
+        prev = old.get((name, arch)) if act in ("Upgrade", "Downgrade", "Reinstall") else None
+        used.add((name, arch) if prev else None)
+        sections.setdefault(HIST_VERBS.get(act, act), []).append([name, evr, reason, prev or ""])
+    for act, name, arch, evr, reason in rows:
+        if act == "Replaced" and (name, arch) not in used:
+            sections.setdefault("Replaced", []).append([name, evr, reason, ""])
+    if not sections:
+        return None
+    labels = (("Begin time", "Started"), ("End time", "Finished"), ("User", "User"),
+              ("Status", "Status"), ("Description", "Command"), ("Comment", "Comment"))
+    return list(sections.items()), [(new, facts[old]) for old, new in labels if facts.get(old)]
+
+
 def plan_problem(text):
     """The reason lines dnf5 prints after a failed resolve."""
     lines = text.split("Failed to resolve the transaction", 1)[1].splitlines()[1:]
@@ -57,10 +95,11 @@ class RunWindow(Adw.Window):
     """Confirms a transaction as a list of package changes, then runs it. Other callers get plain output."""
 
     def __init__(self, parent, title, argv, preview, on_done=None, autorun=False, dry=None,
-                 rebuild=None, note=""):
+                 rebuild=None, note="", parse=None, busy="Calculating changes\u2026"):
         super().__init__(transient_for=parent, modal=True, title=title,
                          default_width=620, default_height=620)
         self.argv, self.on_done, self.note = argv, on_done, note
+        self.parse, self.busy_text = parse or parse_plan, busy
         self.rebuild = rebuild   # rebuild(erase) -> (argv, preview, dry), used to retry
         self.erasing = self.running = False
         self.friendly = bool(dry)
@@ -106,7 +145,7 @@ class RunWindow(Adw.Window):
         self.connect("close-request", lambda *_: self.running)
         if dry:
             self.run_btn.set_sensitive(False)
-            self.set_busy("Calculating changes\u2026")
+            self.set_busy(self.busy_text)
             self.append("Calculating transaction (dry run)...\n")
             threading.Thread(target=self._dry_worker, args=(dry,), daemon=True).start()
         elif autorun:
@@ -161,7 +200,8 @@ class RunWindow(Adw.Window):
                 top.set_description(GLib.markup_escape_text(self.note))
             for label, value in stats:
                 row = Adw.ActionRow(title=label, use_markup=False)
-                row.add_suffix(Gtk.Label(label=value, css_classes=["dim-label"]))
+                row.add_suffix(Gtk.Label(label=value, css_classes=["dim-label"], max_width_chars=48,
+                                         ellipsize=Pango.EllipsizeMode.END))
                 top.add(row)
             page.add(top)
         for head, items in sections:
@@ -192,7 +232,7 @@ class RunWindow(Adw.Window):
         elif "Removing dependent packages" in text or "Removing unused dependencies" in text:
             self.banner.set_title("This also removes other packages. Review before applying.")
             self.banner.set_revealed(True)
-        plan = parse_plan(text)
+        plan = self.parse(text)
         if self.plan_page:
             self.stack.remove(self.plan_page)
         if plan:
@@ -200,7 +240,8 @@ class RunWindow(Adw.Window):
             self.stack.add_named(self.plan_page, "plan")
             self.show("plan")
         else:
-            self.append("--- dry run finished; press Apply to apply ---\n")
+            if self.run_btn.get_visible():
+                self.append("--- dry run finished; press Apply to apply ---\n")
             self.details_btn.set_visible(False)
             self.show("log")
         self.run_btn.set_sensitive(True)
@@ -213,7 +254,7 @@ class RunWindow(Adw.Window):
         self.argv, preview, dry = self.rebuild(True)
         self.append("\n--- retrying with --allowerasing ---\n" + preview +
                     "\nCalculating transaction (dry run)...\n")
-        self.set_busy("Calculating changes\u2026")
+        self.set_busy(self.busy_text)
         threading.Thread(target=self._dry_worker, args=(dry,), daemon=True).start()
 
     def start(self):

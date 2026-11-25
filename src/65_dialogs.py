@@ -65,8 +65,10 @@ class HistoryWindow(Adw.Window):
         return False
 
     def details(self, tid):
-        w = RunWindow(self, f"Transaction {tid}", ["dnf5", "history", "info", str(tid)],
-                      f"dnf5 history info {tid}", autorun=True)
+        w = RunWindow(self, f"Transaction {tid}", [], f"dnf5 history info {tid}",
+                      dry=[["dnf5", "history", "info", str(tid)]], parse=parse_transaction,
+                      busy="Loading transaction\u2026")
+        w.close_btn.set_label("Close")
         w.run_btn.set_visible(False)
         w.present()
 

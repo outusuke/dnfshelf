@@ -67,7 +67,10 @@ def parse_info(text):
             continue
         m = INFO_KEY.match(line)
         if m:
-            rows.append([m[1], m[2]])
+            if m[1] == "Name" and rows:
+                break  # a second block: an available version after the installed one
+            if m[1] == "Name" or rows:
+                rows.append([m[1], m[2]])
     return (intro.strip(), rows) if len(rows) >= 3 else None
 
 
