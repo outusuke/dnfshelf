@@ -576,7 +576,7 @@ class RepoWindow(Adw.Window):
             self.parent_win.run_root("Repositories updated", cmds)
 
     def ask_add(self):
-        where = Adw.EntryRow(title="URL of a .repo file, a .repo file or a folder")
+        where = Adw.EntryRow(title="URL, .repo file or folder")
         rid = Adw.EntryRow(title="Repository id", visible=False)
         form = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE, css_classes=["boxed-list"])
         form.append(where)
@@ -639,12 +639,15 @@ class RepoWindow(Adw.Window):
             fd = Gtk.FileDialog(default_filter=only)
             fd.open(self, None, lambda d_, r: chosen(d_.open_finish, r))
 
-        for icon, tip, cb in (("folder-symbolic", "Choose a local repository folder", pick_folder),
-                              ("document-open-symbolic", "Choose a .repo file", pick_file)):
-            btn = Gtk.Button(icon_name=icon, valign=Gtk.Align.CENTER, css_classes=["flat"],
-                             tooltip_text=tip)
-            btn.connect("clicked", cb)
-            where.add_suffix(btn)
+        choices = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        pop = Gtk.Popover(child=choices)
+        for label, cb in (("Choose folder\u2026", pick_folder), ("Choose .repo file\u2026", pick_file)):
+            item = Gtk.Button(child=Gtk.Label(label=label, xalign=0), css_classes=["flat"])
+            item.connect("clicked", lambda _b, cb=cb: (pop.popdown(), cb()))
+            choices.append(item)
+        where.add_suffix(Gtk.MenuButton(icon_name="document-open-symbolic", valign=Gtk.Align.CENTER,
+                                        css_classes=["flat"], popover=pop,
+                                        tooltip_text="Choose a folder or a .repo file"))
 
         def respond(_d, resp):
             if resp != "add":
