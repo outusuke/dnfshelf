@@ -183,10 +183,11 @@ DESKTOP_ENTRY = """[Desktop Entry]
 Type=Application
 Name=Dnfshelf
 Comment=Synaptic-style package manager for Fedora
-Exec="{exec}"
+Exec="{exec}" %F
 Icon=system-software-install
 Terminal=false
 DBusActivatable=true
+MimeType=application/x-rpm;
 Categories=System;PackageManager;GTK;
 Keywords=dnf;rpm;packages;software;
 StartupWMClass={app_id}
@@ -988,6 +989,16 @@ def parse_repos(text):
         if len(t) >= 2 and t[-1] in ("enabled", "disabled") and t[:2] != ["repo", "id"]:
             repos.append((t[0], " ".join(t[1:-1]), t[-1] == "enabled"))
     return repos
+
+
+def rpm_install_plan(paths):
+    """(argv, preview, dry run commands) to install local .rpm files."""
+    cmd = ["dnf5", "-y", "install", *paths]
+    dry = [c for c in cmd if c != "-y"] + ["--assumeno"]
+    preview = (shlex.join(cmd) + "\n\nThe dry run below shows what will change.\n"
+               "Local files are not signature-checked unless localpkg_gpgcheck is on, "
+               "so install only files you trust.")
+    return ["pkexec", *cmd], preview, [dry]
 
 
 def classify_repo_location(text):
@@ -3106,7 +3117,7 @@ class Win(DetailsMixin, Adw.ApplicationWindow):
 
 class App(Adw.Application):
     def __init__(self):
-        super().__init__(application_id=APP_ID)
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.HANDLES_OPEN)
         act = Gio.SimpleAction.new("open", None)
         act.connect("activate", lambda *_: self.activate())
         self.add_action(act)
@@ -3120,6 +3131,18 @@ class App(Adw.Application):
             self.activate()
             win = next(w for w in self.get_windows() if isinstance(w, Win))
         HistoryWindow(win, auto_only=True).present()
+
+    def do_open(self, files, _n_files, _hint):
+        win = next((w for w in self.get_windows() if isinstance(w, Win)), None)
+        if not win:
+            self.activate()
+            win = next(w for w in self.get_windows() if isinstance(w, Win))
+        paths = [f.get_path() for f in files if f.get_path() and f.get_path().endswith(".rpm")]
+        if not paths:
+            win.toast("Only .rpm files can be opened here")
+            return
+        argv, preview, dry = rpm_install_plan(paths)
+        win.run_cmd("Install local package", argv, preview, reload=True, dry=dry)
 
     def do_activate(self):
         # menu clicks and notification clicks all land here
@@ -3145,4 +3168,4 @@ if __name__ == "__main__":
             print(f"Automatic update skipped: {why}", file=sys.stderr)
         sys.exit(3 if why else 0)
     else:
-        App().run(None)
+        App().run(sys.argv)

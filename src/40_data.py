@@ -172,6 +172,16 @@ def parse_repos(text):
     return repos
 
 
+def rpm_install_plan(paths):
+    """(argv, preview, dry run commands) to install local .rpm files."""
+    cmd = ["dnf5", "-y", "install", *paths]
+    dry = [c for c in cmd if c != "-y"] + ["--assumeno"]
+    preview = (shlex.join(cmd) + "\n\nThe dry run below shows what will change.\n"
+               "Local files are not signature-checked unless localpkg_gpgcheck is on, "
+               "so install only files you trust.")
+    return ["pkexec", *cmd], preview, [dry]
+
+
 def classify_repo_location(text):
     """"repofile" for a .repo URL or file, "folder" for a local repo, "norepodata", or ""."""
     if re.match(r"https?://\S+\.repo$", text) or (text.endswith(".repo") and os.path.isfile(text)):

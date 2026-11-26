@@ -101,6 +101,12 @@ class RepoTests(unittest.TestCase):
         self.assertEqual(d.parse_repos(text), [("fedora", "Fedora 42 - x86_64", True),
                                                ("rpmfusion", "RPM Fusion", False)])
 
+    def test_rpm_install_plan(self):
+        argv, preview, dry = d.rpm_install_plan(["/tmp/a b.rpm", "/tmp/c.rpm"])
+        self.assertEqual(argv, ["pkexec", "dnf5", "-y", "install", "/tmp/a b.rpm", "/tmp/c.rpm"])
+        self.assertEqual(dry, [["dnf5", "install", "/tmp/a b.rpm", "/tmp/c.rpm", "--assumeno"]])
+        self.assertIn("'/tmp/a b.rpm'", preview)
+
     def test_classify_repo_location(self):
         import tempfile
         with tempfile.TemporaryDirectory() as root:
