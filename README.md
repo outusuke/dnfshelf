@@ -21,7 +21,7 @@ python3 dnfshelf.py
 
 ## Features
 
-- Package list with app icons, search (name and description, name only, word start or exact name), sorting and filter modes: All, Installed, Not installed, Upgradable, Queued changes, Security updates, User-installed, Unneeded, Leaves, Extras
+- Package list with app icons, search (name and description, name only, word start or exact name), sorting and filter modes: All, Installed, Not installed, Upgradable, Queued changes, Security updates, User-installed, Unneeded, Leaves, Extras; a second dropdown filters by repository when more than one is enabled
 - Details tabs: Info (with the AppStream description and icon for apps), Dependencies, Files, Changelog, Screenshots (downloaded over https only when the tab is opened, click one to enlarge)
 - Queue several changes, then apply them in one transaction: install, remove, upgrade, reinstall, downgrade
 - Dry run before Apply, Upgrade all and security-only upgrades

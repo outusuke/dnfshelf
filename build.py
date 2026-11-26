@@ -16,13 +16,13 @@ LAYERS = [
     ("00_header.py", "docstring, imports, gi.require_version (the only imports)"),
     ("10_constants.py", "paths, unit templates, dnf5 query formats, mode tables; no logic"),
     ("20_dnf.py", "run dnf5 as the user: read-only queries and their parsers"),
-    ("25_launcher.py", "copy this file to ~/.local/bin, app-menu entry"),
+    ("25_launcher.py", "copy this file to ~/.local/bin, app-menu entry, D-Bus service file"),
     ("30_system.py", "pins, automatic.conf editing, systemd guard and notify units, "
                      "GameMode, GNOME Software"),
     ("35_appstream.py", "AppStream catalog: package name to app metadata and icon, read from local files; optional screenshot fetch"),
     ("40_data.py", "package list assembly, details text, package cache file, "
                    "history and repo parsers"),
-    ("50_model.py", "queue actions, Pkg, PkgModel"),
+    ("50_model.py", "queue actions, Pkg, PkgModel, repository filter"),
     ("60_run.py", "RunWindow: preview, dry run, runs the privileged command"),
     ("65_dialogs.py", "history, pins, automatic updates, groups, repositories windows"),
     ("68_details.py", "DetailsMixin: details tabs and screenshots of the main window"),
