@@ -1,0 +1,18 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: dnf install -y python3-gobject gtk4 libadwaita
+      - name: Check dnfshelf.py is up to date
+        run: python3 build.py --check
+      - name: Run tests
+        run: python3 -m unittest discover -s tests
