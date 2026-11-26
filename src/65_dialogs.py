@@ -569,11 +569,33 @@ class RepoWindow(Adw.Window):
         return (ka > kb) - (ka < kb)
 
     def apply(self):
+        changes = self.changes()
         cmds = [["dnf5", "config-manager", "setopt", f"{rid}.enabled={int(on)}"]
-                for rid, on in self.changes().items()]
-        if cmds:
+                for rid, on in changes.items()]
+        if not cmds:
+            return
+        affected = installed_from_repos(self.parent_win.all, [r for r, on in changes.items() if not on])
+
+        def go():
             self.close()
             self.parent_win.run_root("Repositories updated", cmds)
+
+        if not affected:
+            go()
+            return
+        lines = [f"\u2022 {rid}: {len(names)} package(s), e.g. {', '.join(names[:5])}"
+                 + ("\u2026" if len(names) > 5 else "") for rid, names in affected.items()]
+        dlg = Adw.AlertDialog(
+            heading="Disable repositories in use?",
+            body="These installed packages are offered by a repository you are turning off, "
+                 "so they will stop getting updates:\n" + "\n".join(lines))
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("disable", "Disable anyway")
+        dlg.set_response_appearance("disable", Adw.ResponseAppearance.DESTRUCTIVE)
+        dlg.set_default_response("cancel")
+        dlg.set_close_response("cancel")
+        dlg.connect("response", lambda _d, r: r == "disable" and go())
+        dlg.present(self)
 
     def ask_add(self):
         where = Adw.EntryRow(title="URL, .repo file or folder")

@@ -101,6 +101,13 @@ class RepoTests(unittest.TestCase):
         self.assertEqual(d.parse_repos(text), [("fedora", "Fedora 42 - x86_64", True),
                                                ("rpmfusion", "RPM Fusion", False)])
 
+    def test_installed_from_repos(self):
+        from types import SimpleNamespace as P
+        pkgs = [P(name="vlc", repo="rpmfusion", installed=True), P(name="ffmpeg", repo="rpmfusion", installed=True),
+                P(name="mpv", repo="rpmfusion", installed=False), P(name="bash", repo="fedora", installed=True)]
+        self.assertEqual(d.installed_from_repos(pkgs, ["rpmfusion"]), {"rpmfusion": ["vlc", "ffmpeg"]})
+        self.assertEqual(d.installed_from_repos(pkgs, []), {})
+
     def test_rpm_install_plan(self):
         argv, preview, dry = d.rpm_install_plan(["/tmp/a b.rpm", "/tmp/c.rpm"])
         self.assertEqual(argv, ["pkexec", "dnf5", "-y", "install", "/tmp/a b.rpm", "/tmp/c.rpm"])

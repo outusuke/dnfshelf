@@ -172,6 +172,15 @@ def parse_repos(text):
     return repos
 
 
+def installed_from_repos(pkgs, repo_ids):
+    """{repo id: [names]} of installed packages whose latest version comes from those repos."""
+    ids, found = set(repo_ids), {}
+    for p in pkgs:
+        if p.installed and p.repo in ids:
+            found.setdefault(p.repo, []).append(p.name)
+    return found
+
+
 def rpm_install_plan(paths):
     """(argv, preview, dry run commands) to install local .rpm files."""
     cmd = ["dnf5", "-y", "install", *paths]
