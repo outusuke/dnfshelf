@@ -89,6 +89,14 @@ class PkgModel(GObject.Object, Gio.ListModel):
         self.items_changed(0, removed, len(rows))
 
 
+def repo_names(pkgs):
+    return sorted({p.repo for p in pkgs if p.repo}, key=str.casefold)
+
+
+def filter_rows(rows, repo=None):
+    return rows if repo is None else [p for p in rows if p.repo == repo]
+
+
 def build_pkgs(raw):
     pins = load_pins()
     return [Pkg(d, d[0] in pins) for d in raw]

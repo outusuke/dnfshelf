@@ -137,6 +137,18 @@ class RepoTests(unittest.TestCase):
             self.assertTrue(d.repo_id_taken("fedora", {"fedora": 1}, root))
             self.assertFalse(d.repo_id_taken("local-b", {"fedora": 1}, root))
 
+    def test_filter_rows_by_repo(self):
+        from types import SimpleNamespace as P
+        pkgs = [P(name="bash", repo="fedora", installed=True), P(name="vlc", repo="rpmfusion", installed=False),
+                P(name="mine", repo="(local)", installed=True), P(name="gimp", repo="fedora", installed=False)]
+        self.assertEqual(d.repo_names(pkgs), ["(local)", "fedora", "rpmfusion"])
+        self.assertIs(d.filter_rows(pkgs), pkgs)
+        self.assertEqual([p.name for p in d.filter_rows(pkgs, "fedora")], ["bash", "gimp"])
+        self.assertEqual([p.name for p in d.filter_rows(pkgs, "(local)")], ["mine"])
+        installed = [p for p in pkgs if p.installed]
+        self.assertEqual([p.name for p in d.filter_rows(installed, "fedora")], ["bash"])
+        self.assertEqual(d.filter_rows(pkgs, "gone"), [])
+
 
 if __name__ == "__main__":
     unittest.main()

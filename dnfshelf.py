@@ -106,6 +106,7 @@ WIDE_ENV = {**os.environ, "COLUMNS": "1000"}  # keep dnf5 tables from truncating
 ENGLISH_ENV = {**WIDE_ENV, "LC_MESSAGES": "C", "LANGUAGE": "C"}  # parsers match English words
 MODES = ["All", "Installed", "Not installed", "Upgradable", "Queued changes",
          "Security updates", "User-installed", "Unneeded", "Leaves", "Extras"]
+ALL_REPOS = "All repos"
 M_UPGRADABLE, M_QUEUED, M_SECURITY, M_USER, M_UNNEEDED, M_LEAVES, M_EXTRAS = 3, 4, 5, 6, 7, 8, 9
 # Modes filled by one repoquery each, lazily: mode -> (flags, allow cache-only).
 # Advisory data may be missing from the offline cache, so security may go online.
@@ -1160,6 +1161,14 @@ class PkgModel(GObject.Object, Gio.ListModel):
         removed = len(self.rows)
         self.rows = rows
         self.items_changed(0, removed, len(rows))
+
+
+def repo_names(pkgs):
+    return sorted({p.repo for p in pkgs if p.repo}, key=str.casefold)
+
+
+def filter_rows(rows, repo=None):
+    return rows if repo is None else [p for p in rows if p.repo == repo]
 
 
 def build_pkgs(raw):
@@ -2424,6 +2433,13 @@ class Win(DetailsMixin, Adw.ApplicationWindow):
         self.mode.set_selected(M_USER)
         self.mode.connect("notify::selected", lambda *_: self.refilter())
         hb.pack_start(self.mode)
+        self.repo_dd = Gtk.DropDown.new_from_strings([ALL_REPOS])
+        self.repo_dd.set_visible(False)
+        self.repo_dd.set_tooltip_text("Show packages from one repository")
+        self.repo_dd.connect("notify::selected", self.on_repo)
+        self.repo_choice = None
+        self.repo_ids = []
+        hb.pack_start(self.repo_dd)
         self.check_btn = Gtk.Button(icon_name="view-refresh-symbolic",
                                     tooltip_text="Check for updates")
         self.check_btn.connect("clicked", lambda *_: self.check_updates())
@@ -2875,6 +2891,7 @@ class Win(DetailsMixin, Adw.ApplicationWindow):
                         p.refresh()
             self.update_apply()
         self.sort_all()
+        self.update_repos()
         self.refilter()
         if final:
             self.loading_main = False
@@ -2925,6 +2942,7 @@ class Win(DetailsMixin, Adw.ApplicationWindow):
                 rows = []
             else:
                 rows = [p for p in rows if p.installed and (p.name, p.arch) in keys]
+        rows = filter_rows(rows, self.repo_choice)
         q = self.query
         if q:
             rows = self.search_rows(rows, q)
@@ -2936,6 +2954,22 @@ class Win(DetailsMixin, Adw.ApplicationWindow):
         self.count.set_text(("Checking security advisories\u2026" if mode == M_SECURITY
                              else "Loading\u2026") if loading else text)
         self.sync_empty()
+
+    def update_repos(self):
+        ids = repo_names(self.all)
+        if self.repo_choice not in ids or len(ids) < 2:
+            self.repo_choice = None
+        self.repo_ids = ids
+        self.repo_dd.handler_block_by_func(self.on_repo)
+        self.repo_dd.set_model(Gtk.StringList.new([ALL_REPOS] + ids))
+        self.repo_dd.set_selected(ids.index(self.repo_choice) + 1 if self.repo_choice else 0)
+        self.repo_dd.handler_unblock_by_func(self.on_repo)
+        self.repo_dd.set_visible(len(ids) > 1)
+
+    def on_repo(self, *_):
+        i = self.repo_dd.get_selected()
+        self.repo_choice = self.repo_ids[i - 1] if 0 < i <= len(self.repo_ids) else None
+        self.refilter()
 
     def sync_empty(self):
         """Swap the table for a status page while it has nothing to show."""
