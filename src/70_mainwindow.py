@@ -222,7 +222,7 @@ class Win(DetailsMixin, Adw.ApplicationWindow):
             [("Reload package list", "reload"), ("Refresh repo metadata", "metadata")],
             [("Upgrade all", "upgrade_all"),
              ("Upgrade security updates only", "upgrade_security"), ("Remove unneeded (autoremove)", "autoremove"),
-             ("Clean caches", "clean")],
+             ("Repair package set (distro-sync)", "distro_sync"), ("Clean caches", "clean")],
             [("Mark selected as user-installed", "mark_user"),
              ("Mark selected as dependency", "mark_auto")],
             [("Transaction history", "history"), ("Repositories", "repos"),
@@ -249,6 +249,7 @@ class Win(DetailsMixin, Adw.ApplicationWindow):
         add("upgrade_all", self.upgrade_all)
         add("upgrade_security", self.upgrade_security)
         add("autoremove", self.autoremove)
+        add("distro_sync", self.distro_sync)
         add("clean", lambda: self.quiet("Caches cleaned", ["pkexec", "dnf5", "clean", "all"],
                                         reload=False))
         add("mark_user", lambda: self.mark_selected("install", "user-installed"))
@@ -340,6 +341,14 @@ class Win(DetailsMixin, Adw.ApplicationWindow):
         self.run_cmd("Remove unneeded packages", ["pkexec", *cmd],
                      shlex.join(cmd) + "\n\nThe dry run below shows what will be removed.",
                      reload=True, dry=[dry])
+
+    def distro_sync(self):
+        cmd = ["dnf5", "-y", "distro-sync"]
+        dry = [["dnf5", "check"], ["dnf5", "distro-sync", "--assumeno"]]
+        self.run_cmd("Repair package set", ["pkexec", *cmd],
+                     shlex.join(cmd) + "\n\nThe dry run below runs dnf5 check, then shows what "
+                     "distro-sync would change. It can downgrade packages to the versions in the "
+                     "enabled repositories.", reload=True, dry=dry)
 
     def selected(self):
         bs = self.selection.get_selection()
