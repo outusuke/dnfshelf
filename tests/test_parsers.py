@@ -101,6 +101,21 @@ class RepoTests(unittest.TestCase):
         self.assertEqual(d.parse_repos(text), [("fedora", "Fedora 42 - x86_64", True),
                                                ("rpmfusion", "RPM Fusion", False)])
 
+    def test_classify_repo_location(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as root:
+            os.makedirs(os.path.join(root, "good", "repodata"))
+            open(os.path.join(root, "good", "repodata", "repomd.xml"), "w").close()
+            os.mkdir(os.path.join(root, "empty"))
+            open(os.path.join(root, "x.repo"), "w").close()
+            for loc, want in (("https://dl.example.org/x.repo", "repofile"),
+                              (os.path.join(root, "x.repo"), "repofile"),
+                              (os.path.join(root, "good"), "folder"),
+                              (os.path.join(root, "empty"), "norepodata"),
+                              ("https://example.org/page", ""), ("", ""), ("/no/such/x.repo", "")):
+                self.assertEqual(d.classify_repo_location(loc), want, loc)
+        self.assertEqual(d.local_repo_id("/srv/my repo/"), "local-my-repo")
+
     def test_repo_id_taken(self):
         import tempfile
         with tempfile.TemporaryDirectory() as root:

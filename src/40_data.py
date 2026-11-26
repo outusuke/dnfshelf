@@ -172,6 +172,19 @@ def parse_repos(text):
     return repos
 
 
+def classify_repo_location(text):
+    """"repofile" for a .repo URL or file, "folder" for a local repo, "norepodata", or ""."""
+    if re.match(r"https?://\S+\.repo$", text) or (text.endswith(".repo") and os.path.isfile(text)):
+        return "repofile"
+    if os.path.isdir(text):
+        return "folder" if os.path.exists(os.path.join(text, "repodata", "repomd.xml")) else "norepodata"
+    return ""
+
+
+def local_repo_id(path):
+    return "local-" + re.sub(r"[^A-Za-z0-9_.-]", "-", os.path.basename(path.rstrip("/")) or "repo")
+
+
 def repo_id_taken(rid, known_ids, repo_dir="/etc/yum.repos.d"):
     return rid in known_ids or os.path.exists(os.path.join(repo_dir, rid + ".repo"))
 

@@ -28,7 +28,7 @@ python3 dnfshelf.py
 - Pin or block a package (`dnf5 versionlock`), with a window to review and remove pins
 - Automatic updates through `dnf5 automatic`: check, download or install, all or security only, restart policy, plus GNOME Software's automatic download switch, and desktop notifications that list what was downloaded or installed. Like GNOME Software, a run is skipped on a metered connection or in power saver mode, and also while GameMode is active; it tries again every 30 minutes until that changes (a systemd drop-in written when you save the settings)
 - Groups and environments: install (with optional packages) and remove
-- Repositories: enable, disable, add a local repo
+- Repositories: enable, disable, add from a .repo file, its URL or a local folder
 - Transaction history with undo and rollback, automatic runs marked and filterable
 - Mark packages as user-installed or dependency, autoremove, clean caches
 - Check for updates without a password prompt

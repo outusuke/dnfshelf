@@ -990,6 +990,19 @@ def parse_repos(text):
     return repos
 
 
+def classify_repo_location(text):
+    """"repofile" for a .repo URL or file, "folder" for a local repo, "norepodata", or ""."""
+    if re.match(r"https?://\S+\.repo$", text) or (text.endswith(".repo") and os.path.isfile(text)):
+        return "repofile"
+    if os.path.isdir(text):
+        return "folder" if os.path.exists(os.path.join(text, "repodata", "repomd.xml")) else "norepodata"
+    return ""
+
+
+def local_repo_id(path):
+    return "local-" + re.sub(r"[^A-Za-z0-9_.-]", "-", os.path.basename(path.rstrip("/")) or "repo")
+
+
 def repo_id_taken(rid, known_ids, repo_dir="/etc/yum.repos.d"):
     return rid in known_ids or os.path.exists(os.path.join(repo_dir, rid + ".repo"))
 
@@ -1949,7 +1962,7 @@ class GroupsWindow(Adw.Window):
 
 
 class RepoWindow(Adw.Window):
-    """Enable/disable repositories and add local (file://) repositories."""
+    """Enable/disable repositories and add new ones."""
 
     def __init__(self, parent):
         super().__init__(transient_for=parent, modal=True, title="Repositories",
@@ -1957,8 +1970,8 @@ class RepoWindow(Adw.Window):
         self.parent_win = parent
         self.rows = {}  # repo id -> (SwitchRow, original enabled state)
         hb = Adw.HeaderBar()
-        add_btn = Gtk.Button(label="Add local repo\u2026")
-        add_btn.connect("clicked", lambda *_: self.pick_folder())
+        add_btn = Gtk.Button(label="Add repository\u2026")
+        add_btn.connect("clicked", lambda *_: self.ask_add())
         hb.pack_start(add_btn)
         self.save_btn = Gtk.Button(label="Apply", sensitive=False,
                                    css_classes=["suggested-action"])
@@ -2021,27 +2034,99 @@ class RepoWindow(Adw.Window):
             self.close()
             self.parent_win.run_root("Repositories updated", cmds)
 
-    def pick_folder(self):
-        dlg = Gtk.FileDialog(title="Select a folder containing RPMs and repodata/")
-        dlg.select_folder(self, None, self._folder_chosen)
+    def ask_add(self):
+        where = Adw.EntryRow(title="URL of a .repo file, a .repo file or a folder")
+        rid = Adw.EntryRow(title="Repository id", visible=False)
+        form = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE, css_classes=["boxed-list"])
+        form.append(where)
+        form.append(rid)
+        hint = Gtk.Label(xalign=0, wrap=True, css_classes=["caption", "error"], visible=False)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.append(form)
+        box.append(hint)
+        dlg = Adw.AlertDialog(heading="Add a repository")
+        dlg.set_extra_child(box)
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("add", "Add")
+        dlg.set_response_appearance("add", Adw.ResponseAppearance.SUGGESTED)
+        dlg.set_response_enabled("add", False)
+        dlg.set_close_response("cancel")
+        guessed = [""]
 
-    def _folder_chosen(self, dlg, res):
-        try:
-            folder = dlg.select_folder_finish(res)
-        except GLib.Error:
-            return
-        path = folder.get_path()
-        if not path:
-            return
-        if not os.path.exists(os.path.join(path, "repodata", "repomd.xml")):
-            self.overlay.add_toast(Adw.Toast.new(
-                "No repodata/ found in that folder. Run createrepo_c on it first."))
-            return
-        rid = "local-" + re.sub(r"[^A-Za-z0-9_.-]", "-", os.path.basename(path.rstrip("/")) or "repo")
-        if repo_id_taken(rid, self.rows):
-            self.overlay.add_toast(Adw.Toast.new(f"A repository named {rid} already exists."))
-            return
-        lines = [f"[{rid}]", f"name=Local repo {rid}", f"baseurl={folder.get_uri()}",
+        def check(*_):
+            loc, ident = where.get_text().strip(), rid.get_text().strip()
+            kind = classify_repo_location(loc)
+            bad_where, bad_id, problem = False, False, ""
+            if kind == "norepodata":
+                bad_where, problem = True, "No repodata/ in that folder. Run createrepo_c on it first."
+            elif loc and not kind:
+                bad_where, problem = True, "Use a .repo file, its https:// URL, or a folder with repodata/"
+            elif kind == "folder":
+                if not re.fullmatch(r"[A-Za-z0-9_.-]+", ident):
+                    bad_id, problem = True, "The id can only use letters, digits and . _ -"
+                elif repo_id_taken(ident, self.rows):
+                    bad_id, problem = True, f"A repository named {ident} already exists."
+            rid.set_visible(kind == "folder")
+            hint.set_label(problem)
+            hint.set_visible(bool(problem))
+            (where.add_css_class if bad_where else where.remove_css_class)("error")
+            (rid.add_css_class if bad_id else rid.remove_css_class)("error")
+            dlg.set_response_enabled("add", kind in ("repofile", "folder") and not problem)
+
+        def fill_id(*_):
+            loc = where.get_text().strip()
+            if classify_repo_location(loc) == "folder" and rid.get_text().strip() in ("", guessed[0]):
+                guessed[0] = local_repo_id(loc)  # leave an id the user typed
+                rid.set_text(guessed[0])
+            check()
+
+        def chosen(finish, res):
+            try:
+                path = finish(res).get_path()
+            except GLib.Error:
+                return
+            if path:
+                where.set_text(path)
+
+        def pick_folder(*_):
+            fd = Gtk.FileDialog(title="Select a folder containing RPMs and repodata/")
+            fd.select_folder(self, None, lambda d_, r: chosen(d_.select_folder_finish, r))
+
+        def pick_file(*_):
+            only = Gtk.FileFilter(name="Repository files")
+            only.add_pattern("*.repo")
+            fd = Gtk.FileDialog(default_filter=only)
+            fd.open(self, None, lambda d_, r: chosen(d_.open_finish, r))
+
+        for icon, tip, cb in (("folder-symbolic", "Choose a local repository folder", pick_folder),
+                              ("document-open-symbolic", "Choose a .repo file", pick_file)):
+            btn = Gtk.Button(icon_name=icon, valign=Gtk.Align.CENTER, css_classes=["flat"],
+                             tooltip_text=tip)
+            btn.connect("clicked", cb)
+            where.add_suffix(btn)
+
+        def respond(_d, resp):
+            if resp != "add":
+                return
+            loc = where.get_text().strip()
+            if classify_repo_location(loc) == "folder":
+                self.add_folder(loc, rid.get_text().strip())
+            else:
+                self.add_repofile(loc)
+
+        where.connect("changed", fill_id)
+        rid.connect("changed", check)
+        dlg.connect("response", respond)
+        dlg.present(self)
+
+    def add_repofile(self, loc):
+        cmd = f"dnf5 config-manager addrepo --from-repofile={loc}"
+        preview = f"Add the repositories defined in {loc} (as root):\n\n  {cmd}\n\nPress Run to execute."
+        self.close()
+        self.parent_win.run_cmd("Add repository", ["pkexec", *shlex.split(cmd)], preview, reload=True)
+
+    def add_folder(self, path, rid):
+        lines = [f"[{rid}]", f"name=Local repo {rid}", f"baseurl={Gio.File.new_for_path(path).get_uri()}",
                  "enabled=1", "gpgcheck=0", "skip_if_unavailable=1"]
         script = "printf '%s\\n' " + " ".join(shlex.quote(x) for x in lines) + \
                  f" > /etc/yum.repos.d/{rid}.repo"
