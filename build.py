@@ -25,6 +25,7 @@ LAYERS = [
     ("50_model.py", "queue actions, Pkg, PkgModel"),
     ("60_run.py", "RunWindow: preview, dry run, runs the privileged command"),
     ("65_dialogs.py", "history, pins, automatic updates, groups, repositories windows"),
+    ("68_details.py", "DetailsMixin: details tabs and screenshots of the main window"),
     ("70_mainwindow.py", "Win: package table, queue, plan() and apply()"),
     ("80_app.py", "App and the command-line entry point"),
 ]
