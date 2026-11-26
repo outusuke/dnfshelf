@@ -49,6 +49,8 @@ from gi.repository import Adw, Gdk, GdkPixbuf, Gio, GLib, GObject, Gtk, Pango  #
 
 
 APP_ID = "org.outusuke.Dnfshelf"
+VERSION = "0.1.0"
+REPO_URL = "https://github.com/outusuke/dnfshelf"
 VERSIONLOCK_FILE = "/etc/dnf/versionlock.toml"
 AUTO_CONF = "/etc/dnf/automatic.conf"
 AUTO_DEFAULTS_CONF = "/usr/share/dnf5/dnf5-plugins/automatic.conf"
@@ -2649,6 +2651,7 @@ class Win(DetailsMixin, Adw.ApplicationWindow):
              ("Automatic updates", "auto_updates")],
             [("Install to app menu", "install_launcher"),
              ("Remove from app menu", "remove_launcher")],
+            [("About Dnfshelf", "about")],
         ]
         for sec in sections:
             s = Gio.Menu()
@@ -2680,9 +2683,16 @@ class Win(DetailsMixin, Adw.ApplicationWindow):
         add("auto_updates", lambda: AutoUpdatesWindow(self).present())
         add("install_launcher", lambda: self.launcher(install_launcher))
         add("remove_launcher", lambda: self.launcher(uninstall_launcher))
+        add("about", self.show_about)
         mark = Gio.SimpleAction.new("mark", GLib.VariantType.new("s"))
         mark.connect("activate", lambda _a, param: self.mark(param.get_string()))
         self.add_action(mark)
+
+    def show_about(self):
+        Adw.AboutDialog(application_name="Dnfshelf", application_icon=APP_ID, version=VERSION,
+                        developer_name="outusuke", developers=["outusuke"],
+                        copyright="\u00a9 2026 outusuke", license_type=Gtk.License.GPL_3_0,
+                        website=REPO_URL, issue_url=REPO_URL + "/issues").present(self)
 
     def upgrade_flow(self, title, extra=(), note=""):
         """Upgrade with a dry run first; offers --allowerasing only if that dry run fails."""

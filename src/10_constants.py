@@ -1,4 +1,6 @@
 APP_ID = "org.outusuke.Dnfshelf"
+VERSION = "0.1.0"
+REPO_URL = "https://github.com/outusuke/dnfshelf"
 VERSIONLOCK_FILE = "/etc/dnf/versionlock.toml"
 AUTO_CONF = "/etc/dnf/automatic.conf"
 AUTO_DEFAULTS_CONF = "/usr/share/dnf5/dnf5-plugins/automatic.conf"
