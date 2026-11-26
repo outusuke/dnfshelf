@@ -1367,6 +1367,11 @@ class RunWindow(Adw.Window):
         plan = self.parse(text)
         if self.plan_page:
             self.stack.remove(self.plan_page)
+        if not plan and "Nothing to do." in text:
+            self.set_result("object-select-symbolic", "Nothing to do",
+                            "There is nothing to change.")
+            self.close_btn.set_label("Close")
+            return False
         if plan:
             self.plan_page = self._plan_widget(*plan)
             self.stack.add_named(self.plan_page, "plan")
