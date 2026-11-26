@@ -1177,12 +1177,24 @@ def build_pkgs(raw):
 
 
 # ---------------------------------------------------------------- run window
-PLAN_ROW = re.compile(r"^ (\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\d[\d.,]* \S+)\s*$")
-REPL_ROW = re.compile(r"^\s+replacing (\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\d[\d.,]* \S+)\s*$")
+PLAN_ROW = re.compile(r"^ (\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\d[\d.,]*\s+\S+)\s*$")
+REPL_ROW = re.compile(r"^\s+replacing (\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\d[\d.,]*\s+\S+)\s*$")
 PLAN_HEAD = re.compile(r"^([A-Z][A-Za-z ]+):\s*$")
 PLAN_COUNT = re.compile(r"^ ([A-Z][A-Za-z ]+):\s+(\d+) packages?\s*$")
 PLAN_DOWNLOAD = re.compile(r"Need to download ([\d.,]+ \S+?)\.")
 PLAN_DISK = re.compile(r"After this operation, ([\d.,]+ \S+) (extra will be used|will be freed)")
+
+
+PLAN_STYLES = (("Install", "list-add-symbolic", "success"),
+               ("Upgrad", "go-up-symbolic", "accent"),
+               ("Downgrad", "go-down-symbolic", "warning"),
+               ("Reinstall", "view-refresh-symbolic", "accent"),
+               ("Remov", "list-remove-symbolic", "error"))
+
+
+def plan_style(head):
+    """(icon name, css class) for a plan section heading, or None."""
+    return next((s[1:] for s in PLAN_STYLES if head.startswith(s[0])), None)
 
 
 def parse_plan(text):
@@ -1205,7 +1217,7 @@ def parse_plan(text):
                 continue
             m = PLAN_ROW.match(line)
             if m:
-                cur[1].append([m[1], m[3].removeprefix("0:"), m[5], ""])
+                cur[1].append([m[1], m[3].removeprefix("0:"), " ".join(m[5].split()), ""])
     sections = [sec for sec in sections if sec[1]]
     total = sum(len(items) for _, items in sections)
     if not total or total != sum(n for k, n in counts.items() if k != "Replacing"):
@@ -1385,9 +1397,12 @@ class RunWindow(Adw.Window):
             page.add(top)
         for head, items in sections:
             group = Adw.PreferencesGroup(title=f"{head} ({len(items)})")
+            style = plan_style(head)
             for name, evr, size, old in items:
                 row = Adw.ActionRow(title=name, subtitle=f"{old} \u2192 {evr}" if old else evr,
                                     use_markup=False)
+                if style:
+                    row.add_prefix(Gtk.Image(icon_name=style[0], css_classes=[style[1]]))
                 row.add_suffix(Gtk.Label(label=size, css_classes=["dim-label"]))
                 group.add(row)
             page.add(group)

@@ -51,6 +51,28 @@ class PlanTests(unittest.TestCase):
         text = "Failed to resolve the transaction:\nProblem: conflict\n\nYou can try to add --allowerasing"
         self.assertEqual(d.plan_problem(text), "Problem: conflict")
 
+    def test_plan_with_padded_byte_sizes(self):
+        text = """Package   Arch   Version   Repository   Size
+Downgrading:
+ kernel-devel-matched x86_64 0:7.3.4-300.fc45 updates         0.0   B
+   replacing kernel-devel-matched x86_64 0:7.3.5-300.fc45 updates-testing   0.0   B
+ perf x86_64 0:7.3.4-300.fc45 updates        14.0 MiB
+   replacing perf x86_64 0:7.3.5-300.fc45 updates-testing  14.0 MiB
+
+Transaction Summary:
+ Replacing:        2 packages
+ Downgrading:      2 packages
+"""
+        sections, _stats = d.parse_plan(text)
+        self.assertEqual(sections, [("Downgrading", [["kernel-devel-matched", "7.3.4-300.fc45", "0.0 B", "7.3.5-300.fc45"],
+                                                     ["perf", "7.3.4-300.fc45", "14.0 MiB", "7.3.5-300.fc45"]])])
+
+    def test_plan_style(self):
+        self.assertEqual(d.plan_style("Installing dependencies"), ("list-add-symbolic", "success"))
+        self.assertEqual(d.plan_style("Removing unused dependencies")[1], "error")
+        self.assertEqual(d.plan_style("Downgrading")[1], "warning")
+        self.assertIsNone(d.plan_style("Something else"))
+
 
 class TransactionTests(unittest.TestCase):
     def test_grouped_with_previous_version(self):
