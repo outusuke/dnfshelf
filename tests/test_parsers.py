@@ -101,6 +101,14 @@ class RepoTests(unittest.TestCase):
         self.assertEqual(d.parse_repos(text), [("fedora", "Fedora 42 - x86_64", True),
                                                ("rpmfusion", "RPM Fusion", False)])
 
+    def test_repo_id_taken(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as root:
+            open(os.path.join(root, "local-a.repo"), "w").close()
+            self.assertTrue(d.repo_id_taken("local-a", {}, root))
+            self.assertTrue(d.repo_id_taken("fedora", {"fedora": 1}, root))
+            self.assertFalse(d.repo_id_taken("local-b", {"fedora": 1}, root))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -537,7 +537,7 @@ class RepoWindow(Adw.Window):
         threading.Thread(target=self._load, daemon=True).start()
 
     def _load(self):
-        GLib.idle_add(self._populate, parse_repos(run(["dnf5", "repo", "list", "--all"])))
+        GLib.idle_add(self._populate, parse_repos(run(["dnf5", "repo", "list", "--all"], env=ENGLISH_ENV)))
 
     def _populate(self, repos):
         while (row := self.box.get_first_child()):
@@ -592,6 +592,9 @@ class RepoWindow(Adw.Window):
                 "No repodata/ found in that folder. Run createrepo_c on it first."))
             return
         rid = "local-" + re.sub(r"[^A-Za-z0-9_.-]", "-", os.path.basename(path.rstrip("/")) or "repo")
+        if repo_id_taken(rid, self.rows):
+            self.overlay.add_toast(Adw.Toast.new(f"A repository named {rid} already exists."))
+            return
         lines = [f"[{rid}]", f"name=Local repo {rid}", f"baseurl={folder.get_uri()}",
                  "enabled=1", "gpgcheck=0", "skip_if_unavailable=1"]
         script = "printf '%s\\n' " + " ".join(shlex.quote(x) for x in lines) + \

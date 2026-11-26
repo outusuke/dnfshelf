@@ -53,6 +53,7 @@ PKG_QF = r"%{name}\n"
 SO_CAP = re.compile(r"^([^()\s]+\.so[^()\s]*)\(.*\)$")
 COMPS_RE = re.compile(r"^(\S+)\s+(.+?)\s+(yes|no)\s*$")
 WIDE_ENV = {**os.environ, "COLUMNS": "1000"}  # keep dnf5 tables from truncating names
+ENGLISH_ENV = {**WIDE_ENV, "LC_MESSAGES": "C", "LANGUAGE": "C"}  # parsers match English words
 MODES = ["All", "Installed", "Not installed", "Upgradable", "Queued changes",
          "Security updates", "User-installed", "Unneeded", "Leaves", "Extras"]
 M_UPGRADABLE, M_QUEUED, M_SECURITY, M_USER, M_UNNEEDED, M_LEAVES, M_EXTRAS = 3, 4, 5, 6, 7, 8, 9

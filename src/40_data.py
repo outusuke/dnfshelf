@@ -172,6 +172,10 @@ def parse_repos(text):
     return repos
 
 
+def repo_id_taken(rid, known_ids, repo_dir="/etc/yum.repos.d"):
+    return rid in known_ids or os.path.exists(os.path.join(repo_dir, rid + ".repo"))
+
+
 HISTORY_RE = re.compile(
     r"^\s*(\d+)\s+(.*?)\s+(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s+(.*?)\s*$")
 

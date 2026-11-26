@@ -103,6 +103,7 @@ PKG_QF = r"%{name}\n"
 SO_CAP = re.compile(r"^([^()\s]+\.so[^()\s]*)\(.*\)$")
 COMPS_RE = re.compile(r"^(\S+)\s+(.+?)\s+(yes|no)\s*$")
 WIDE_ENV = {**os.environ, "COLUMNS": "1000"}  # keep dnf5 tables from truncating names
+ENGLISH_ENV = {**WIDE_ENV, "LC_MESSAGES": "C", "LANGUAGE": "C"}  # parsers match English words
 MODES = ["All", "Installed", "Not installed", "Upgradable", "Queued changes",
          "Security updates", "User-installed", "Unneeded", "Leaves", "Extras"]
 M_UPGRADABLE, M_QUEUED, M_SECURITY, M_USER, M_UNNEEDED, M_LEAVES, M_EXTRAS = 3, 4, 5, 6, 7, 8, 9
@@ -987,6 +988,10 @@ def parse_repos(text):
         if len(t) >= 2 and t[-1] in ("enabled", "disabled") and t[:2] != ["repo", "id"]:
             repos.append((t[0], " ".join(t[1:-1]), t[-1] == "enabled"))
     return repos
+
+
+def repo_id_taken(rid, known_ids, repo_dir="/etc/yum.repos.d"):
+    return rid in known_ids or os.path.exists(os.path.join(repo_dir, rid + ".repo"))
 
 
 HISTORY_RE = re.compile(
@@ -1978,7 +1983,7 @@ class RepoWindow(Adw.Window):
         threading.Thread(target=self._load, daemon=True).start()
 
     def _load(self):
-        GLib.idle_add(self._populate, parse_repos(run(["dnf5", "repo", "list", "--all"])))
+        GLib.idle_add(self._populate, parse_repos(run(["dnf5", "repo", "list", "--all"], env=ENGLISH_ENV)))
 
     def _populate(self, repos):
         while (row := self.box.get_first_child()):
@@ -2033,6 +2038,9 @@ class RepoWindow(Adw.Window):
                 "No repodata/ found in that folder. Run createrepo_c on it first."))
             return
         rid = "local-" + re.sub(r"[^A-Za-z0-9_.-]", "-", os.path.basename(path.rstrip("/")) or "repo")
+        if repo_id_taken(rid, self.rows):
+            self.overlay.add_toast(Adw.Toast.new(f"A repository named {rid} already exists."))
+            return
         lines = [f"[{rid}]", f"name=Local repo {rid}", f"baseurl={folder.get_uri()}",
                  "enabled=1", "gpgcheck=0", "skip_if_unavailable=1"]
         script = "printf '%s\\n' " + " ".join(shlex.quote(x) for x in lines) + \
